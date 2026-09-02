@@ -1,0 +1,21 @@
+[project]
+name = "reconai"
+version = "0.2.0"
+description = "Multi-agent enterprise data reconciliation and incident investigation MVP"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "crewai>=1.15.18,<2.0",
+    "gradio>=5.0,<7.0",
+    "pandas>=2.2,<3.0",
+    "pydantic>=2.7,<3.0",
+    "python-dotenv>=1.0,<2.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.0,<10.0"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+

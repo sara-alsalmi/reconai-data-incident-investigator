@@ -1,0 +1,46 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Python environments and package caches
+.venv/
+venv/
+.uv-cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Test, coverage, and code-quality caches
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Real, downloaded, generated, and temporary data
+data/
+sample_data/
+uploads/
+outputs/
+*.csv
+*.tsv
+*.xlsx
+*.xls
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+
+# Build artifacts
+build/
+dist/
+
+# Local editor and operating-system files
+.gradio/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
