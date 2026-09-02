@@ -189,8 +189,8 @@ This wording intentionally describes an association unless uploaded data proves 
 
 Run all deterministic and integration-style tests without an API key:
 
-```bash
-pytest -q
+```powershell
+uv run pytest -q
 ```
 
 The suite independently checks all six tools, profiling, evidence preservation, rejection/retry transitions, successful reporting, the three-attempt limit, and mandatory inconclusive output. It does not assert nondeterministic LLM prose.
