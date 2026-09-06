@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import threading
 from datetime import datetime
 from typing import Any
@@ -31,8 +32,11 @@ def _redact(value: Any, limit: int = 500) -> str:
 
 def _emit(kind: str, message: str) -> None:
     timestamp = datetime.now().strftime("%H:%M:%S")
+    line = f"[{timestamp}] [CrewAI] [{kind}] {message}"
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    safe_line = line.encode(encoding, errors="replace").decode(encoding)
     with _PRINT_LOCK:
-        print(f"[{timestamp}] [CrewAI] [{kind}] {message}", flush=True)
+        print(safe_line, flush=True)
 
 
 def ensure_terminal_listener() -> None:
@@ -112,4 +116,3 @@ def ensure_terminal_listener() -> None:
 
     _LISTENER = ReconAITerminalListener()
     _emit("READY", "Live operational trace enabled (prompts and hidden reasoning omitted)")
-

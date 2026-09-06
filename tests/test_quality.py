@@ -9,7 +9,7 @@ from src.models import (
     Verdict,
     VerificationResult,
 )
-from src.state import add_trace
+from src.state import _console_safe, add_trace
 
 
 def test_quality_guide_prefers_channel_and_flags_constant_status():
@@ -116,6 +116,10 @@ def test_trace_prints_live_safe_event(capsys):
     assert "[ReconAI:abcdef12]" in output
     assert "[TOOL]" in output
     assert "Profiled test.csv" in output
+
+
+def test_trace_text_is_safe_for_legacy_windows_encoding():
+    assert _console_safe("source − warehouse", "cp1252") == "source ? warehouse"
 
 
 def test_report_ignores_unfiltered_whole_dataset_impact():

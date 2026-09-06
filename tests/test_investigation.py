@@ -4,12 +4,219 @@ import pandas as pd
 
 from src.agents.runtime import CrewAIRuntime
 from src.flow import ReconAIInvestigationFlow
+from src.flow.investigation_flow import apply_verification_guard
 from src.models import (
+    DatasetProfile,
     EvidenceItem,
     InvestigationAttempt,
+    InvestigationState,
     Verdict,
     VerificationResult,
 )
+
+
+def test_controller_rejects_agentic_acceptance_without_fresh_evidence():
+    investigation_state = InvestigationState(
+        investigation_id="fresh-evidence-guard",
+        question="Explain the net amount difference.",
+        dataset_paths=["source.csv", "target.csv"],
+        evidence=[
+            EvidenceItem(
+                evidence_id="E001",
+                attempt=0,
+                finding="Baseline count comparison",
+                tool="compare_aggregates",
+                supporting_details={"aggregation": "count"},
+            )
+        ],
+    )
+    attempt = InvestigationAttempt(
+        findings=["The amount differs."],
+        hypothesis="The uploaded datasets have a net amount difference.",
+        evidence_ids=["E001"],
+    )
+    accepted = VerificationResult(
+        verdict=Verdict.ACCEPT,
+        confidence=0.9,
+        reason="The conclusion is supported.",
+    )
+
+    guarded = apply_verification_guard(investigation_state, attempt, accepted)
+
+    assert guarded.verdict == Verdict.REJECT
+    assert "no fresh diagnostic evidence" in guarded.reason
+
+
+def test_controller_accepts_complete_offsetting_evidence_chain():
+    evidence_specs = [
+        ("E001", 0, "compare_aggregates", {"aggregation": "count", "absolute_difference": 0.0}),
+        ("E002", 0, "find_unmatched_records", {"unmatched_count": 40}),
+        ("E003", 0, "find_unmatched_records", {"unmatched_count": 0}),
+        (
+            "E004",
+            0,
+            "find_duplicates",
+            {"analysis_type": "exact_row", "duplicate_row_count": 80},
+        ),
+        ("E005", 0, "compare_rows_by_key", {"record_mismatch_count": 0}),
+        (
+            "E006",
+            1,
+            "compare_aggregates",
+            {"aggregation": "sum", "signed_difference_a_minus_b": 726530.49},
+        ),
+    ]
+    state = InvestigationState(
+        investigation_id="complete-offsetting",
+        question="Identify every cause and calculate the net amount difference.",
+        dataset_paths=["source.csv", "target.csv"],
+        evidence=[
+            EvidenceItem(
+                evidence_id=evidence_id,
+                attempt=attempt_number,
+                finding="deterministic evidence",
+                tool=tool,
+                supporting_details=details,
+            )
+            for evidence_id, attempt_number, tool, details in evidence_specs
+        ],
+    )
+    attempt = InvestigationAttempt(
+        findings=["Missing records and exact duplicates coexist."],
+        hypothesis=(
+            "Missing source records and exact duplicate target rows coexist; the "
+            "measured source-minus-target amount difference is 726,530.49."
+        ),
+        evidence_ids=["E002", "E004", "E005", "E006"],
+    )
+    over_demanding_rejection = VerificationResult(
+        verdict=Verdict.REJECT,
+        confidence=0.4,
+        reason="A decomposition of the independently measured net sum is required.",
+    )
+
+    guarded = apply_verification_guard(state, attempt, over_demanding_rejection)
+
+    assert guarded.verdict == Verdict.ACCEPT
+    assert guarded.confidence == 0.9
+    assert "complete deterministic evidence chain" in guarded.reason
+
+    attempt.hypothesis = "Missing records and duplicates produce a difference of 1.00."
+    still_rejected = apply_verification_guard(
+        state, attempt, over_demanding_rejection
+    )
+    assert still_rejected.verdict == Verdict.REJECT
+
+
+def test_controller_requires_and_validates_paired_segment_evidence():
+    profiles = [
+        DatasetProfile(
+            dataset=name,
+            path=name,
+            row_count=2,
+            columns=["record_id", "priority", "amount"],
+            data_types={"record_id": "int64", "priority": "object", "amount": "float64"},
+            null_counts={"record_id": 0, "priority": 0, "amount": 0},
+            duplicate_count=0,
+            unique_counts={"record_id": 2, "priority": 2, "amount": 2},
+            possible_identifier_columns=["record_id"],
+            numeric_columns=["record_id", "amount"],
+        )
+        for name in ("source.csv", "target.csv")
+    ]
+    base_evidence = [
+        EvidenceItem(
+            evidence_id="E001",
+            attempt=0,
+            finding="45 value mismatches",
+            tool="compare_record_values",
+            supporting_details={"value_mismatch_count": 45},
+        ),
+        *[
+            EvidenceItem(
+                evidence_id=f"E00{index}",
+                attempt=0,
+                finding="No unmatched rows",
+                tool="find_unmatched_records",
+                supporting_details={"unmatched_count": 0},
+            )
+            for index in (2, 3)
+        ],
+        *[
+            EvidenceItem(
+                evidence_id=f"E00{index}",
+                attempt=0,
+                finding="No exact duplicates",
+                tool="find_duplicates",
+                supporting_details={
+                    "analysis_type": "exact_row",
+                    "duplicate_row_count": 0,
+                },
+            )
+            for index in (4, 5)
+        ],
+    ]
+    segment_results = (
+        [{"priority": "2-HIGH", "value": 100.0}, {"priority": "1-URGENT", "value": 50.0}],
+        [{"priority": "2-HIGH", "value": 123.5}, {"priority": "1-URGENT", "value": 50.0}],
+    )
+    segment_evidence = [
+        EvidenceItem(
+            evidence_id=f"E00{index}",
+            attempt=1,
+            finding="Paired priority totals",
+            tool="segment_analysis",
+            supporting_details={
+                "dataset": dataset,
+                "grouping": ["priority"],
+                "metric_column": "amount",
+                "aggregation": "sum",
+                "filtered_record_count": 2,
+                "results": results,
+                "results_truncated": False,
+            },
+        )
+        for index, dataset, results in zip(
+            (6, 7), ("source.csv", "target.csv"), segment_results
+        )
+    ]
+    state = InvestigationState(
+        investigation_id="segment-guard",
+        question="Which priority contains the amount difference?",
+        dataset_paths=["source.csv", "target.csv"],
+        dataset_profiles=profiles,
+        evidence=[*base_evidence, *segment_evidence],
+    )
+    accepted = VerificationResult(
+        verdict=Verdict.ACCEPT,
+        confidence=0.95,
+        reason="Accepted by the verifier.",
+    )
+    wrong_attempt = InvestigationAttempt(
+        hypothesis="The amount difference is in 1-URGENT.",
+        evidence_ids=["E001", "E006", "E007"],
+    )
+
+    guarded_wrong = apply_verification_guard(state, wrong_attempt, accepted)
+
+    assert guarded_wrong.verdict == Verdict.REJECT
+    assert "does not match the paired segment totals" in guarded_wrong.reason
+
+    correct_attempt = InvestigationAttempt(
+        hypothesis="The amount difference is isolated to 2-HIGH.",
+        evidence_ids=["E001", "E006", "E007"],
+    )
+    over_demanding_rejection = VerificationResult(
+        verdict=Verdict.REJECT,
+        confidence=0.4,
+        reason="More localization is required.",
+    )
+    guarded_correct = apply_verification_guard(
+        state, correct_attempt, over_demanding_rejection
+    )
+
+    assert guarded_correct.verdict == Verdict.ACCEPT
+    assert "paired `priority` totals isolate" in guarded_correct.reason
 
 
 class AcceptingRuntime:
@@ -288,22 +495,36 @@ def test_localization_question_uses_agent_after_value_drift(tmp_path):
 
         def investigate(self, state, previous_verification):
             self.investigate_called = True
-            evidence_id = f"E{len(state.evidence) + 1:03d}"
-            state.evidence.append(
-                EvidenceItem(
-                    evidence_id=evidence_id,
-                    attempt=state.attempt_count,
-                    finding="Amount drift is concentrated in 2-HIGH",
-                    tool="segment_analysis",
-                    datasets=["source.csv", "target.csv"],
-                    value=1,
-                    supporting_details={"segment": "2-HIGH"},
+            evidence_ids = []
+            for dataset, high_value in (("source.csv", 20.0), ("target.csv", 25.0)):
+                evidence_id = f"E{len(state.evidence) + 1:03d}"
+                evidence_ids.append(evidence_id)
+                state.evidence.append(
+                    EvidenceItem(
+                        evidence_id=evidence_id,
+                        attempt=state.attempt_count,
+                        finding=f"Amount totals by priority in {dataset}",
+                        tool="segment_analysis",
+                        datasets=[dataset],
+                        value=2,
+                        supporting_details={
+                            "dataset": dataset,
+                            "grouping": ["order_priority"],
+                            "metric_column": "amount",
+                            "aggregation": "sum",
+                            "filtered_record_count": 2,
+                            "results": [
+                                {"order_priority": "1-URGENT", "value": 10.0},
+                                {"order_priority": "2-HIGH", "value": high_value},
+                            ],
+                            "results_truncated": False,
+                        },
+                    )
                 )
-            )
             return InvestigationAttempt(
                 findings=["2-HIGH contains the amount drift"],
                 hypothesis="The amount mismatch is concentrated in 2-HIGH.",
-                evidence_ids=[evidence_id],
+                evidence_ids=evidence_ids,
             )
 
         def verify(self, state, attempt):

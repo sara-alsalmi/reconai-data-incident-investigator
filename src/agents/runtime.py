@@ -39,7 +39,7 @@ def build_openrouter_llm(settings: Settings) -> Any:
         api_key=settings.openrouter_api_key,
         base_url=settings.openrouter_base_url,
         temperature=0,
-        max_tokens=4096,
+        max_tokens=8192,
     )
 
 
@@ -980,6 +980,9 @@ class CrewAIRuntime:
     def investigate(
         self, state: InvestigationState, previous_verification: VerificationResult | None
     ) -> InvestigationAttempt:
+        from src.baseline import collect_question_required_evidence
+
+        collect_question_required_evidence(state)
         evidence = [
             _normalize_numbers(item.model_dump(mode="json")) for item in state.evidence
         ]
@@ -1005,6 +1008,10 @@ full-shared-row checks for every inferred relationship. Interpret that existing 
 before calling anything. If it proves no discrepancy, stop without more tools and state only
 the checked scope. If it proves a discrepancy, use at most the few additional tools needed to
 localize its segment, time range, or measurable impact.
+
+The controller may also have added a question-required comparison during this attempt. Treat
+any evidence item whose attempt number matches the current attempt as fresh mandatory evidence,
+cite its evidence ID, and do not repeat that exact call.
 
 The user does not need to describe table cardinality or prescribe tools. Infer intent from
 the natural-language question, profiles, filenames, shared keys, and observed cardinality.

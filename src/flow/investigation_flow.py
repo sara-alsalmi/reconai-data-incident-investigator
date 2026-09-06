@@ -57,6 +57,177 @@ _DIAGNOSTIC_TOOLS = {
 }
 
 
+def _segment_localization_requested(question: str) -> bool:
+    lowered = question.lower()
+    return any(
+        term in lowered
+        for term in ("which", "where", "segment", "category", "priority", "channel", "region")
+    ) and any(
+        term in lowered
+        for term in ("amount", "total", "value", "revenue", "balance", "difference", "mismatch")
+    )
+
+
+def _paired_segment_localization(
+    state: InvestigationState, attempt: InvestigationAttempt
+) -> tuple[str, list[str], list[str]] | None:
+    """Return cited segments whose paired full-dataset totals differ."""
+    profile_rows = {profile.dataset: profile.row_count for profile in state.dataset_profiles}
+    segment_evidence = [
+        item
+        for item in state.evidence
+        if item.tool == "segment_analysis"
+        and item.attempt > 0
+        and len(item.supporting_details.get("grouping", [])) == 1
+        and not item.supporting_details.get("results_truncated")
+        and item.supporting_details.get("filtered_record_count")
+        == profile_rows.get(item.supporting_details.get("dataset"))
+    ]
+    cited = set(attempt.evidence_ids)
+    for index, left in enumerate(segment_evidence):
+        left_details = left.supporting_details
+        for right in segment_evidence[index + 1 :]:
+            right_details = right.supporting_details
+            if (
+                left_details.get("dataset") == right_details.get("dataset")
+                or left_details.get("grouping") != right_details.get("grouping")
+                or left_details.get("metric_column") != right_details.get("metric_column")
+                or left_details.get("aggregation") != right_details.get("aggregation")
+                or left.evidence_id not in cited
+                or right.evidence_id not in cited
+            ):
+                continue
+            dimension = left_details["grouping"][0]
+            left_values = {
+                str(row.get(dimension)): float(row["value"])
+                for row in left_details.get("results", [])
+            }
+            right_values = {
+                str(row.get(dimension)): float(row["value"])
+                for row in right_details.get("results", [])
+            }
+            differing = sorted(
+                segment
+                for segment in left_values.keys() | right_values.keys()
+                if round(
+                    left_values.get(segment, 0.0) - right_values.get(segment, 0.0),
+                    6,
+                )
+                != 0
+            )
+            if differing:
+                return dimension, differing, [left.evidence_id, right.evidence_id]
+    return None
+
+
+def _complete_localized_value_reconciliation(
+    state: InvestigationState,
+    attempt: InvestigationAttempt,
+    localization: tuple[str, list[str], list[str]],
+) -> bool:
+    """Check that paired segment totals fully localize a matched-key value drift."""
+    _, differing_segments, _ = localization
+    hypothesis = attempt.hypothesis.lower()
+    if not all(segment.lower() in hypothesis for segment in differing_segments):
+        return False
+    value_mismatches = any(
+        item.tool == "compare_record_values"
+        and item.supporting_details.get("value_mismatch_count", 0) > 0
+        for item in state.evidence
+    )
+    matching_keys = all(
+        item.supporting_details.get("unmatched_count") == 0
+        for item in state.evidence
+        if item.tool == "find_unmatched_records"
+    )
+    no_exact_duplicates = all(
+        item.supporting_details.get("duplicate_row_count") == 0
+        for item in state.evidence
+        if item.tool == "find_duplicates"
+        and item.supporting_details.get("analysis_type") == "exact_row"
+    )
+    return value_mismatches and matching_keys and no_exact_duplicates
+
+
+def _complete_offsetting_reconciliation(
+    state: InvestigationState, attempt: InvestigationAttempt
+) -> bool:
+    """Recognize a fully evidenced missing-plus-duplicate reconciliation."""
+    evidence = state.evidence
+    count_checks = [
+        item
+        for item in evidence
+        if item.tool == "compare_aggregates"
+        and item.supporting_details.get("aggregation") == "count"
+        and item.supporting_details.get("absolute_difference") == 0
+    ]
+    missing = [
+        item
+        for item in evidence
+        if item.tool == "find_unmatched_records"
+        and item.supporting_details.get("unmatched_count", 0) > 0
+    ]
+    matched_directions = [
+        item
+        for item in evidence
+        if item.tool == "find_unmatched_records"
+        and item.supporting_details.get("unmatched_count") == 0
+    ]
+    duplicates = [
+        item
+        for item in evidence
+        if item.tool == "find_duplicates"
+        and item.supporting_details.get("analysis_type") == "exact_row"
+        and item.supporting_details.get("duplicate_row_count", 0) > 0
+    ]
+    matching_rows = [
+        item
+        for item in evidence
+        if item.tool == "compare_rows_by_key"
+        and item.supporting_details.get("record_mismatch_count") == 0
+    ]
+    sum_checks = [
+        item
+        for item in evidence
+        if item.tool == "compare_aggregates"
+        and item.attempt > 0
+        and item.supporting_details.get("aggregation") == "sum"
+        and isinstance(
+            item.supporting_details.get("signed_difference_a_minus_b"),
+            (int, float),
+        )
+    ]
+    if not all(
+        (count_checks, missing, matched_directions, duplicates, matching_rows, sum_checks)
+    ):
+        return False
+
+    cited = set(attempt.evidence_ids)
+    required_ids = {
+        missing[0].evidence_id,
+        duplicates[0].evidence_id,
+        matching_rows[0].evidence_id,
+        sum_checks[-1].evidence_id,
+    }
+    if not required_ids <= cited:
+        return False
+
+    hypothesis = attempt.hypothesis.lower()
+    if not any(term in hypothesis for term in ("missing", "absent", "unmatched")):
+        return False
+    if not any(term in hypothesis for term in ("duplicate", "duplicated")):
+        return False
+    difference = float(
+        sum_checks[-1].supporting_details["signed_difference_a_minus_b"]
+    )
+    numeric_forms = {
+        f"{difference:.2f}",
+        f"{difference:,.2f}",
+        f"{difference:g}",
+    }
+    return any(value in attempt.hypothesis for value in numeric_forms)
+
+
 def apply_verification_guard(
     state: InvestigationState,
     attempt: InvestigationAttempt,
@@ -79,6 +250,70 @@ def apply_verification_guard(
                 "State only the data-level discrepancy; keep possible technical mechanisms "
                 "in remaining uncertainty unless direct logs prove them."
             ],
+        )
+    localization = (
+        _paired_segment_localization(state, attempt)
+        if _segment_localization_requested(state.question)
+        else None
+    )
+    if _segment_localization_requested(state.question):
+        if localization is None and verification.verdict == Verdict.ACCEPT:
+            return VerificationResult(
+                verdict=Verdict.REJECT,
+                confidence=min(verification.confidence, 0.3),
+                reason=(
+                    "Controller rejected a segment conclusion without cited paired "
+                    "full-dataset segment evidence."
+                ),
+                missing_evidence=[
+                    "Compare the requested metric by the same segment in both datasets."
+                ],
+            )
+        if localization is not None:
+            dimension, differing_segments, _ = localization
+            missing_segments = [
+                segment
+                for segment in differing_segments
+                if segment.lower() not in lowered
+            ]
+            if missing_segments and verification.verdict == Verdict.ACCEPT:
+                return VerificationResult(
+                    verdict=Verdict.REJECT,
+                    confidence=min(verification.confidence, 0.3),
+                    reason=(
+                        f"Controller rejected the `{dimension}` conclusion because it "
+                        "does not match the paired segment totals."
+                    ),
+                    missing_evidence=[
+                        f"Use the supported differing segment(s): {', '.join(differing_segments)}."
+                    ],
+                )
+            if (
+                verification.verdict == Verdict.REJECT
+                and _complete_localized_value_reconciliation(
+                    state, attempt, localization
+                )
+            ):
+                return VerificationResult(
+                    verdict=Verdict.ACCEPT,
+                    confidence=max(verification.confidence, 0.9),
+                    reason=(
+                        f"Controller confirmed that paired `{dimension}` totals isolate "
+                        f"the discrepancy to {', '.join(differing_segments)}."
+                    ),
+                )
+    if (
+        verification.verdict == Verdict.REJECT
+        and _complete_offsetting_reconciliation(state, attempt)
+    ):
+        return VerificationResult(
+            verdict=Verdict.ACCEPT,
+            confidence=max(verification.confidence, 0.9),
+            reason=(
+                "Controller confirmed a complete deterministic evidence chain: "
+                "balanced row counts, one-directional missing keys, exact duplicates, "
+                "matching shared rows, and an independently measured net sum."
+            ),
         )
     question = state.question.lower()
     duplicate_constraint = "do not" in question and any(
@@ -121,6 +356,24 @@ def apply_verification_guard(
             reason="Controller rejected acceptance without cited diagnostic evidence.",
             missing_evidence=[
                 "Cite at least one deterministic reconciliation evidence ID."
+            ],
+        )
+    fresh_diagnostic_evidence = [
+        item
+        for item in state.evidence
+        if item.attempt > 0 and item.tool in _DIAGNOSTIC_TOOLS
+    ]
+    if verification.verdict == Verdict.ACCEPT and not fresh_diagnostic_evidence:
+        return VerificationResult(
+            verdict=Verdict.REJECT,
+            confidence=min(verification.confidence, 0.3),
+            reason=(
+                "Controller rejected acceptance because the agentic investigation "
+                "collected no fresh diagnostic evidence."
+            ),
+            missing_evidence=[
+                "Use a deterministic tool to collect the unresolved evidence requested "
+                "by the question."
             ],
         )
     return verification

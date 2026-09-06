@@ -67,9 +67,13 @@ than labeling them duplicate errors.
 - Important facts come from deterministic pandas tools, not model arithmetic.
 - Every reported finding is tied to an evidence ID.
 - Verification, bounded retries, and safe inconclusive results reduce unsupported conclusions.
-- Current results: **37/37 automated tests** and **12/12 repeated deterministic benchmark runs**.
-- The latest hard agentic benchmark scored **1/2** with the configured free model; agent quality and
-  availability still depend on the selected provider.
+- Current results: **43/43 automated tests**, **12/12 repeated deterministic benchmark runs**, and
+  **2/2 agentic TPC-H cases** in the latest single-run evaluation.
+- The agentic cases test two general behaviors: explaining offsetting missing/duplicate records and
+  localizing a numeric discrepancy to the responsible category. No dataset name or expected answer
+  is hardcoded into the investigation logic.
+- Free-model availability and consistency can vary, so repeated agentic runs are still recommended
+  before making production reliability claims.
 
 See [evaluation details](evals/README.md) for benchmark setup and commands.
 
