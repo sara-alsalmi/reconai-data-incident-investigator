@@ -25,7 +25,10 @@ def create_investigator_agent(llm: Any, tools: list[Any]) -> Any:
         llm=llm,
         tools=tools,
         allow_delegation=False,
-        max_iter=16,
+        # Reconciliation questions often need several evidence calls before a
+        # final answer. Four iterations can end immediately after a tool result,
+        # leaving CrewAI with no structured conclusion to validate.
+        max_iter=8,
         max_retry_limit=2,
         respect_context_window=True,
         verbose=False,

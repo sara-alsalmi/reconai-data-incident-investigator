@@ -67,7 +67,7 @@ def profile_dataset(path: str | Path) -> dict:
 
 
 def infer_relationships(profiles: list[DatasetProfile]) -> None:
-    """Add conservative relationship candidates based only on shared key names."""
+    """Add shared-key candidates together with their observed dataset grain."""
     for profile in profiles:
         relationships: list[dict] = []
         for other in profiles:
@@ -77,13 +77,30 @@ def infer_relationships(profiles: list[DatasetProfile]) -> None:
                 other.possible_identifier_columns
             )
             for column in sorted(shared):
+                local_eligible = profile.row_count - profile.null_counts.get(column, 0)
+                other_eligible = other.row_count - other.null_counts.get(column, 0)
+                local_unique = profile.unique_counts.get(column, 0) == local_eligible
+                other_unique = other.unique_counts.get(column, 0) == other_eligible
+                if local_unique and other_unique:
+                    cardinality = "one_to_one"
+                elif local_unique:
+                    cardinality = "one_to_many"
+                elif other_unique:
+                    cardinality = "many_to_one"
+                else:
+                    cardinality = "many_to_many"
                 relationships.append(
                     {
                         "dataset": other.dataset,
                         "local_column": column,
                         "other_column": column,
-                        "basis": "shared identifier column name; cardinality not yet verified",
+                        "cardinality": cardinality,
+                        "local_key_is_unique": local_unique,
+                        "other_key_is_unique": other_unique,
+                        "basis": (
+                            "shared identifier column name with cardinality inferred from "
+                            "non-null key uniqueness"
+                        ),
                     }
                 )
         profile.possible_relationships = relationships
-

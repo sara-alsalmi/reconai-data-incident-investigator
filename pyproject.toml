@@ -14,8 +14,8 @@ dependencies = [
 
 [dependency-groups]
 dev = ["pytest>=8.0,<10.0"]
+eval = ["duckdb>=1.4,<2.0"]
 
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
-

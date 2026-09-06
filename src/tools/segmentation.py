@@ -63,8 +63,32 @@ def segment_analysis(
         require_columns(frame, [date_column], Path(dataset_path).name)
         parsed = pd.to_datetime(frame[date_column], errors="coerce")
         frame = frame.loc[parsed.notna()].copy()
+        period_aliases = {
+            "day": "D",
+            "daily": "D",
+            "week": "W",
+            "weekly": "W",
+            "month": "M",
+            "monthly": "M",
+            "quarter": "Q",
+            "quarterly": "Q",
+            "year": "Y",
+            "yearly": "Y",
+        }
+        normalized_frequency = period_aliases.get(
+            date_frequency.strip().lower(), date_frequency
+        )
         period_column = "__period"
-        frame[period_column] = parsed.loc[parsed.notna()].dt.to_period(date_frequency).astype(str)
+        try:
+            frame[period_column] = (
+                parsed.loc[parsed.notna()]
+                .dt.to_period(normalized_frequency)
+                .astype(str)
+            )
+        except ValueError as exc:
+            raise ToolInputError(
+                "Invalid date frequency. Use D/day, W/week, M/month, Q/quarter, or Y/year."
+            ) from exc
         grouping.append(period_column)
     if not grouping:
         raise ToolInputError("Provide group_by_column or date_column")
@@ -95,4 +119,3 @@ def segment_analysis(
         "results_truncated": len(records) > limit,
         "match_context": match_context,
     }
-

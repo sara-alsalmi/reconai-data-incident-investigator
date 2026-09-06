@@ -7,6 +7,7 @@ from typing import Protocol
 from uuid import uuid4
 
 from src.agents.runtime import CrewAIRuntime
+from src.baseline import collect_baseline_evidence
 from src.config import MAX_INVESTIGATION_ATTEMPTS
 from src.models import (
     DatasetProfile,
@@ -35,6 +36,355 @@ class AgentRuntime(Protocol):
     def report(self, state: InvestigationState, conclusive: bool) -> str: ...
 
 
+_UNSUPPORTED_TECHNICAL_CAUSES = (
+    "pipeline",
+    "etl",
+    "software bug",
+    "ingestion failure",
+    "loading failure",
+    "deployment",
+    "system outage",
+)
+
+_DIAGNOSTIC_TOOLS = {
+    "compare_aggregates",
+    "find_unmatched_records",
+    "compare_record_values",
+    "compare_rows_by_key",
+    "find_duplicates",
+    "segment_analysis",
+    "calculate_business_impact",
+}
+
+
+def apply_verification_guard(
+    state: InvestigationState,
+    attempt: InvestigationAttempt,
+    verification: VerificationResult,
+) -> VerificationResult:
+    """Apply non-LLM acceptance rules after the verifier responds."""
+    lowered = attempt.hypothesis.lower()
+    unsupported = [
+        term for term in _UNSUPPORTED_TECHNICAL_CAUSES if term in lowered
+    ]
+    if unsupported:
+        return VerificationResult(
+            verdict=Verdict.REJECT,
+            confidence=min(verification.confidence, 0.4),
+            reason=(
+                "Controller rejected an unsupported technical mechanism in the "
+                f"hypothesis: {', '.join(unsupported)}."
+            ),
+            missing_evidence=[
+                "State only the data-level discrepancy; keep possible technical mechanisms "
+                "in remaining uncertainty unless direct logs prove them."
+            ],
+        )
+    question = state.question.lower()
+    duplicate_constraint = "do not" in question and any(
+        term in question for term in ("duplicate", "repeated", "repeat")
+    )
+    duplicate_claim = any(
+        term in lowered
+        for term in (
+            "duplicate records caused",
+            "duplicate rows caused",
+            "caused by duplicate",
+            "caused by repeated",
+            "repeated keys explain",
+            "duplicates explain",
+        )
+    )
+    if duplicate_constraint and duplicate_claim:
+        return VerificationResult(
+            verdict=Verdict.REJECT,
+            confidence=min(verification.confidence, 0.3),
+            reason=(
+                "Controller rejected a duplicate-error claim that conflicts with an "
+                "explicit instruction in the investigation question."
+            ),
+            missing_evidence=[
+                "Respect the stated relationship grain and answer only the requested "
+                "unique-key coverage question."
+            ],
+        )
+    cited = set(attempt.evidence_ids)
+    diagnostic_citations = [
+        item
+        for item in state.evidence
+        if item.evidence_id in cited and item.tool in _DIAGNOSTIC_TOOLS
+    ]
+    if verification.verdict == Verdict.ACCEPT and not diagnostic_citations:
+        return VerificationResult(
+            verdict=Verdict.REJECT,
+            confidence=min(verification.confidence, 0.3),
+            reason="Controller rejected acceptance without cited diagnostic evidence.",
+            missing_evidence=[
+                "Cite at least one deterministic reconciliation evidence ID."
+            ],
+        )
+    return verification
+
+
+def deterministic_clean_match(state: InvestigationState) -> bool:
+    """Return true only when baseline evidence proves complete equality for a pair."""
+    if len(state.dataset_profiles) != 2:
+        return False
+    left, right = state.dataset_profiles
+    if left.row_count != right.row_count or set(left.columns) != set(right.columns):
+        return False
+    row_checks = [
+        item for item in state.evidence if item.tool == "compare_rows_by_key"
+    ]
+    if len(row_checks) != 1:
+        return False
+    row_details = row_checks[0].supporting_details
+    if row_details.get("record_mismatch_count") != 0:
+        return False
+    if row_details.get("matched_unique_key_count") != left.row_count:
+        return False
+    expected_columns = set(left.columns) - {
+        row_details.get("key_column_a"),
+        row_details.get("key_column_b"),
+    }
+    if set(row_details.get("columns_compared", [])) != expected_columns:
+        return False
+    required_zero_fields = {
+        "compare_aggregates": "absolute_difference",
+        "find_unmatched_records": "unmatched_count",
+        "find_duplicates": "duplicate_row_count",
+    }
+    for tool, field in required_zero_fields.items():
+        matching = [item for item in state.evidence if item.tool == tool]
+        required_count = 1 if tool == "compare_aggregates" else 2
+        if len(matching) < required_count:
+            return False
+        if any(item.supporting_details.get(field) != 0 for item in matching):
+            return False
+    unmatched = [
+        item for item in state.evidence if item.tool == "find_unmatched_records"
+    ]
+    if any(item.supporting_details.get("null_key_count_a") != 0 for item in unmatched):
+        return False
+    return True
+
+
+def _key_coverage_hypothesis(key_checks: list) -> str:
+    clauses: list[str] = []
+    record_details: list[str] = []
+    for item in key_checks:
+        details = item.supporting_details
+        count = int(
+            details.get(
+                "unmatched_unique_key_count", details.get("unmatched_count", 0)
+            )
+        )
+        value_word = "value" if count == 1 else "values"
+        verb = "is" if count == 1 else "are"
+        clauses.append(
+            f"{count} {details.get('key_column_a', 'key')} {value_word} in "
+            f"{details.get('dataset_a')} {verb} absent from {details.get('dataset_b')}"
+        )
+        for sample in details.get("sample_unmatched_records", []):
+            rendered = ", ".join(
+                f"{column}={value}" for column, value in sample.items()
+            )
+            record_details.append(
+                f"{details.get('dataset_a')} ({rendered}; {item.evidence_id})"
+            )
+    detail_sentence = ""
+    if record_details:
+        label = "Affected record" if len(record_details) == 1 else "Affected records"
+        detail_sentence = f" {label}: " + "; ".join(record_details) + "."
+    return (
+        "Within the uploaded files, " + "; ".join(clauses) + "."
+        + detail_sentence
+        + " This proves the dataset-level key gap, but not why it occurred."
+    )
+
+
+def deterministic_baseline_conclusion(
+    state: InvestigationState,
+) -> tuple[str, str] | None:
+    """Return a proven baseline conclusion for common single-cause reconciliations."""
+    if deterministic_clean_match(state):
+        return (
+            "No discrepancy detected within the validated scope.",
+            "Equal schemas, row counts, key coverage, duplicate checks, and shared row values.",
+        )
+    if len(state.dataset_profiles) != 2:
+        return None
+    lowered_question = state.question.lower()
+    coverage_requested = any(
+        term in lowered_question
+        for term in ("missing", "unmatched", "absent", "coverage", "correspond")
+    )
+    duplicate_forbidden = "do not" in lowered_question and any(
+        term in lowered_question for term in ("duplicate", "repeated", "repeat")
+    )
+    value_analysis_requested = any(
+        term in lowered_question
+        for term in (
+            "amount",
+            "total",
+            "revenue",
+            "balance",
+            "sum",
+        )
+    ) or (
+        "value" in lowered_question
+        and any(term in lowered_question for term in ("differ", "mismatch"))
+    )
+    other_analysis_requested = value_analysis_requested or any(
+        term in lowered_question
+        for term in (
+            "segment",
+            "region",
+            "channel",
+            "category",
+            "priority",
+            "where",
+            "when",
+            "period",
+            "date",
+            "month",
+            "year",
+        )
+    ) or (
+        not duplicate_forbidden
+        and any(
+            term in lowered_question for term in ("duplicate", "repeated", "repeat")
+        )
+    )
+    key_checks = [
+        item for item in state.evidence if item.tool == "find_unmatched_records"
+    ]
+    if coverage_requested and not other_analysis_requested and len(key_checks) == 2:
+        return (
+            _key_coverage_hypothesis(key_checks),
+            "Bidirectional deterministic key checks fully answer the requested coverage scope.",
+        )
+    count_checks = [
+        item for item in state.evidence if item.tool == "compare_aggregates"
+    ]
+    row_checks = [
+        item for item in state.evidence if item.tool == "compare_rows_by_key"
+    ]
+    unmatched = [
+        item
+        for item in state.evidence
+        if item.tool == "find_unmatched_records"
+        and item.supporting_details.get("unmatched_count", 0) > 0
+    ]
+    duplicates = [
+        item
+        for item in state.evidence
+        if item.tool == "find_duplicates"
+        and item.supporting_details.get("duplicate_row_count", 0) > 0
+        and item.supporting_details.get("analysis_type") != "repeated_key"
+    ]
+    broad_investigation = any(
+        term in lowered_question
+        for term in ("investigate", "disagree", "reconcile", "affected record")
+    )
+    has_key_gap = any(
+        item.supporting_details.get(
+            "unmatched_unique_key_count",
+            item.supporting_details.get("unmatched_count", 0),
+        )
+        > 0
+        for item in key_checks
+    )
+    no_null_key_ambiguity = all(
+        item.supporting_details.get("null_key_count_a", 0) == 0
+        for item in key_checks
+    )
+    if (
+        broad_investigation
+        and not other_analysis_requested
+        and len(key_checks) == 2
+        and has_key_gap
+        and no_null_key_ambiguity
+        and not duplicates
+    ):
+        return (
+            _key_coverage_hypothesis(key_checks),
+            "Deterministic bidirectional key checks and affected-record details establish "
+            "the observed discrepancy; raw row counts are interpreted using relationship grain.",
+        )
+    if len(count_checks) != 1 or len(row_checks) != 1:
+        return None
+    count_details = count_checks[0].supporting_details
+    row_details = row_checks[0].supporting_details
+    count_gap = float(count_details.get("absolute_difference", 0))
+    row_mismatches = int(row_details.get("record_mismatch_count", 0))
+
+    if len(unmatched) == 1 and not duplicates and row_mismatches == 0:
+        details = unmatched[0].supporting_details
+        missing_count = int(details["unmatched_count"])
+        if count_gap == missing_count:
+            hypothesis = (
+                f"{missing_count} records in {details['dataset_a']} have {details['key_column_a']} "
+                f"values absent from {details['dataset_b']}, fully explaining the row-count gap."
+            )
+            return hypothesis, "A one-directional key gap exactly equals the row-count difference."
+
+    if len(duplicates) == 1 and not unmatched and row_mismatches == 0 and count_gap > 0:
+        details = duplicates[0].supporting_details
+        duplicate_records = int(details["duplicate_row_count"])
+        duplicate_dataset = details["dataset"]
+        profile_rows = {
+            profile.dataset: profile.row_count for profile in state.dataset_profiles
+        }
+        other_dataset = next(name for name in profile_rows if name != duplicate_dataset)
+        if profile_rows[duplicate_dataset] - profile_rows[other_dataset] == count_gap:
+            hypothesis = (
+                f"{duplicate_dataset} is {int(count_gap)} rows larger and contains "
+                f"{duplicate_records} exact duplicate rows; no unmatched "
+                "keys or differences among the remaining unique-key rows were found."
+            )
+            return hypothesis, "Exact full-row duplicates fully explain the row-count gap."
+
+    localization_terms = (
+        "where",
+        "which",
+        "concentrat",
+        "segment",
+        "priority",
+        "region",
+        "channel",
+        "when",
+        "month",
+        "period",
+    )
+    localization_requested = any(
+        term in state.question.lower() for term in localization_terms
+    )
+    localization_evidence = any(
+        item.tool in {"segment_analysis", "calculate_business_impact"}
+        for item in state.evidence
+    )
+    if (
+        not unmatched
+        and not duplicates
+        and count_gap == 0
+        and row_mismatches > 0
+        and (not localization_requested or localization_evidence)
+    ):
+        differing = [
+            column
+            for column, count in row_details.get("mismatches_by_column", {}).items()
+            if count > 0
+        ]
+        if differing:
+            hypothesis = (
+                f"{row_mismatches} matched keys contain value mismatches in: "
+                f"{', '.join(differing)}. Row counts and key coverage otherwise match."
+            )
+            return hypothesis, "Complete shared-row comparison isolates a value-level discrepancy."
+    return None
+
+
 class ReconAIInvestigationFlow:
     """A deterministic control loop containing bounded CrewAI agent tasks."""
 
@@ -59,10 +409,31 @@ class ReconAIInvestigationFlow:
 
     def run(self) -> InvestigationResult:
         self._profile()
+        collect_baseline_evidence(self.state)
         runtime = self.runtime or CrewAIRuntime(self.state)
-        add_trace(self.state, "agent", "Data Profiler Agent started profile review")
+        add_trace(self.state, "agent", "Deterministic Profiler started profile review")
         runtime.review_profiles(self.state)
-        add_trace(self.state, "agent", "Data Profiler Agent reviewed dataset profiles")
+        add_trace(self.state, "agent", "Deterministic Profiler reviewed dataset profiles")
+
+        baseline_conclusion = deterministic_baseline_conclusion(self.state)
+        if baseline_conclusion:
+            self.state.hypothesis, baseline_reason = baseline_conclusion
+            self.state.verification = VerificationResult(
+                verdict=Verdict.ACCEPT,
+                confidence=1.0,
+                reason=baseline_reason,
+            )
+            add_trace(
+                self.state,
+                "verification",
+                "Controller accepted a fully explained deterministic baseline without an LLM call",
+            )
+            report = runtime.report(self.state, conclusive=True)
+            self.state.final_report = report
+            add_trace(self.state, "complete", "Investigation finished")
+            return InvestigationResult(
+                state=self.state, report=report, trace=render_trace(self.state)
+            )
 
         previous_verification: VerificationResult | None = None
         accepted = False
@@ -111,6 +482,16 @@ class ReconAIInvestigationFlow:
                 f"Evidence Verifier Agent started review for attempt {attempt_number}",
             )
             verification = runtime.verify(self.state, attempt)
+            guarded_verification = apply_verification_guard(
+                self.state, attempt, verification
+            )
+            if guarded_verification != verification:
+                add_trace(
+                    self.state,
+                    "quality",
+                    f"Controller overruled verifier: {guarded_verification.reason}",
+                )
+            verification = guarded_verification
             self.state.verification = verification
             previous_verification = verification
             add_trace(
@@ -133,7 +514,7 @@ class ReconAIInvestigationFlow:
         add_trace(
             self.state,
             "agent",
-            "Business Report Agent started structured report generation",
+            "Evidence Report Renderer started structured report generation",
         )
         report = runtime.report(self.state, conclusive=accepted)
         if not accepted:
@@ -141,7 +522,7 @@ class ReconAIInvestigationFlow:
             if "Root Cause: Inconclusive" not in report or "Confidence: Low" not in report:
                 report = required + report
         self.state.final_report = report
-        add_trace(self.state, "agent", "Business Report Agent generated the final report")
+        add_trace(self.state, "agent", "Evidence Report Renderer generated the final report")
         add_trace(self.state, "complete", "Investigation finished")
         return InvestigationResult(
             state=self.state, report=report, trace=render_trace(self.state)

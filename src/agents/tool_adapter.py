@@ -12,6 +12,8 @@ from src.state import add_trace
 from src.tools import (
     calculate_business_impact,
     compare_aggregates,
+    compare_record_values,
+    compare_rows_by_key,
     find_duplicates,
     find_unmatched_records,
     profile_dataset,
@@ -21,6 +23,8 @@ from src.tools import (
 
 def _safe_json(value: str, expected: type) -> Any:
     parsed = json.loads(value or ("[]" if expected is list else "{}"))
+    if expected is list and parsed == {}:
+        return []
     if not isinstance(parsed, expected):
         raise ValueError(f"Expected JSON {expected.__name__}")
     return parsed
@@ -59,8 +63,8 @@ class ToolAuditor:
                     "tool, filter, grouping, metric, direction, or time grain."
                 }
             )
-        self.state.tool_call_signatures.append(signature)
         result = function()
+        self.state.tool_call_signatures.append(signature)
         evidence_id = f"E{len(self.state.evidence) + 1:03d}"
         finding, metric, value = _summarize(tool_name, result)
         self.state.evidence.append(
@@ -102,15 +106,42 @@ def _summarize(tool: str, result: dict) -> tuple[str, str | None, Any]:
             result["absolute_difference"],
         )
     if tool == "find_unmatched_records":
+        key_count = result.get("unmatched_unique_key_count", result["unmatched_count"])
+        key_word = "value" if key_count == 1 else "values"
+        row_word = "row" if result["unmatched_count"] == 1 else "rows"
         return (
-            f"Found {result['unmatched_count']} unmatched records "
-            f"({result['unmatched_percentage']:.2f}%) in {result['direction']}",
-            "unmatched_count",
-            result["unmatched_count"],
+            f"Found {key_count} {result['key_column_a']} {key_word} in "
+            f"{result['dataset_a']} with no match in {result['dataset_b']} "
+            f"({result['unmatched_count']} {row_word}, "
+            f"{result['unmatched_percentage']:.2f}%)",
+            "unmatched_unique_key_count",
+            key_count,
+        )
+    if tool == "compare_record_values":
+        return (
+            f"Found {result['value_mismatch_count']} value mismatches across "
+            f"{result['matched_unique_key_count']} matched unique keys",
+            "value_mismatch_count",
+            result["value_mismatch_count"],
+        )
+    if tool == "compare_rows_by_key":
+        return (
+            f"Found {result['record_mismatch_count']} row mismatches across "
+            f"{result['matched_unique_key_count']} matched unique keys",
+            "record_mismatch_count",
+            result["record_mismatch_count"],
         )
     if tool == "find_duplicates":
+        if result.get("analysis_type") == "repeated_key":
+            return (
+                f"Found {result['duplicate_row_count']} records participating in repeated "
+                f"keys in {result['dataset']}; repeated keys are not automatically errors",
+                "repeated_key_record_count",
+                result["duplicate_row_count"],
+            )
         return (
-            f"Found {result['duplicate_row_count']} duplicate rows in {result['dataset']}",
+            f"Found {result['duplicate_row_count']} exact duplicate rows in "
+            f"{result['dataset']}",
             "duplicate_row_count",
             result["duplicate_row_count"],
         )
@@ -122,9 +153,12 @@ def _summarize(tool: str, result: dict) -> tuple[str, str | None, Any]:
             "filtered_record_count",
             result["filtered_record_count"],
         )
+    count = result["affected_record_count"]
+    record_word = "record" if count == 1 else "records"
+    has_measured_impact = result.get("affected_amount_sum") is not None
     return (
-        f"Calculated impact for {result['affected_record_count']} affected records in "
-        f"{result['dataset']}",
+        f"{'Calculated measurable impact for' if has_measured_impact else 'Scoped'} "
+        f"{count} affected {record_word} in {result['dataset']}",
         "affected_record_count",
         result["affected_record_count"],
     )
@@ -169,22 +203,64 @@ def build_crewai_tools(state: InvestigationState) -> list[Any]:
 
     @tool("find_unmatched_records")
     def find_unmatched_records_tool(
-        dataset_a: str, dataset_b: str, key_column_a: str, key_column_b: str
+        dataset_a: str,
+        dataset_b: str,
+        key_column_a: str,
+        key_column_b: str,
+        detail_columns_json: str = "[]",
     ) -> str:
-        """Find records in dataset A whose key does not occur in dataset B. Direction matters."""
-        args = locals().copy()
+        """Find keys in A absent from B and preview affected rows. Direction matters. Blank detail_columns_json automatically chooses useful status/date/value context."""
+        detail_columns = _safe_json(detail_columns_json, list)
+        args = {
+            "dataset_a": dataset_a,
+            "dataset_b": dataset_b,
+            "key_column_a": key_column_a,
+            "key_column_b": key_column_b,
+            "detail_columns": detail_columns or None,
+        }
         return auditor.execute(
             "find_unmatched_records",
             args,
             [dataset_a, dataset_b],
             lambda: find_unmatched_records(
-                auditor.path(dataset_a), auditor.path(dataset_b), key_column_a, key_column_b
+                auditor.path(dataset_a),
+                auditor.path(dataset_b),
+                key_column_a,
+                key_column_b,
+                detail_columns or None,
+            ),
+        )
+
+    @tool("compare_record_values")
+    def compare_record_values_tool(
+        dataset_a: str,
+        dataset_b: str,
+        key_column_a: str,
+        key_column_b: str,
+        value_column_a: str,
+        value_column_b: str,
+        tolerance: float = 0.0,
+    ) -> str:
+        """Compare numeric or categorical values for matching unique keys in two datasets."""
+        args = locals().copy()
+        return auditor.execute(
+            "compare_record_values",
+            args,
+            [dataset_a, dataset_b],
+            lambda: compare_record_values(
+                auditor.path(dataset_a),
+                auditor.path(dataset_b),
+                key_column_a,
+                key_column_b,
+                value_column_a,
+                value_column_b,
+                tolerance,
             ),
         )
 
     @tool("find_duplicates")
     def find_duplicates_tool(dataset: str, key_columns_json: str = "[]") -> str:
-        """Find duplicate rows in a dataset, optionally using a JSON list of key columns."""
+        """With blank keys, find exact full-row duplicates. With key columns, report repeated-key participation; repeated relationship keys may be valid one-to-many data."""
         keys = _safe_json(key_columns_json, list)
         args = {"dataset": dataset, "key_columns": keys}
         return auditor.execute(
@@ -192,6 +268,39 @@ def build_crewai_tools(state: InvestigationState) -> list[Any]:
             args,
             [dataset],
             lambda: find_duplicates(auditor.path(dataset), keys or None),
+        )
+
+    @tool("compare_rows_by_key")
+    def compare_rows_by_key_tool(
+        dataset_a: str,
+        dataset_b: str,
+        key_column_a: str,
+        key_column_b: str,
+        columns_json: str = "[]",
+        tolerance: float = 0.0,
+    ) -> str:
+        """Compare all shared fields, or a JSON list of fields, for matching unique keys."""
+        columns = _safe_json(columns_json, list)
+        args = {
+            "dataset_a": dataset_a,
+            "dataset_b": dataset_b,
+            "key_column_a": key_column_a,
+            "key_column_b": key_column_b,
+            "columns": columns,
+            "tolerance": tolerance,
+        }
+        return auditor.execute(
+            "compare_rows_by_key",
+            args,
+            [dataset_a, dataset_b],
+            lambda: compare_rows_by_key(
+                auditor.path(dataset_a),
+                auditor.path(dataset_b),
+                key_column_a,
+                key_column_b,
+                columns or None,
+                tolerance,
+            ),
         )
 
     @tool("segment_analysis")
@@ -288,8 +397,9 @@ def build_crewai_tools(state: InvestigationState) -> list[Any]:
         profile_dataset_tool,
         compare_aggregates_tool,
         find_unmatched_records_tool,
+        compare_record_values_tool,
         find_duplicates_tool,
+        compare_rows_by_key_tool,
         segment_analysis_tool,
         calculate_business_impact_tool,
     ]
-
