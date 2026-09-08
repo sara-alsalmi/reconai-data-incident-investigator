@@ -6,7 +6,6 @@ from src.agents.runtime import CrewAIRuntime
 from src.flow import ReconAIInvestigationFlow
 from src.flow.investigation_flow import apply_verification_guard
 from src.models import (
-    DatasetProfile,
     EvidenceItem,
     InvestigationAttempt,
     InvestigationState,
@@ -15,7 +14,7 @@ from src.models import (
 )
 
 
-def test_controller_rejects_agentic_acceptance_without_fresh_evidence():
+def test_controller_allows_acceptance_from_cited_baseline_evidence():
     investigation_state = InvestigationState(
         investigation_id="fresh-evidence-guard",
         question="Explain the net amount difference.",
@@ -43,180 +42,66 @@ def test_controller_rejects_agentic_acceptance_without_fresh_evidence():
 
     guarded = apply_verification_guard(investigation_state, attempt, accepted)
 
-    assert guarded.verdict == Verdict.REJECT
-    assert "no fresh diagnostic evidence" in guarded.reason
+    assert guarded == accepted
 
 
-def test_controller_accepts_complete_offsetting_evidence_chain():
-    evidence_specs = [
-        ("E001", 0, "compare_aggregates", {"aggregation": "count", "absolute_difference": 0.0}),
-        ("E002", 0, "find_unmatched_records", {"unmatched_count": 40}),
-        ("E003", 0, "find_unmatched_records", {"unmatched_count": 0}),
-        (
-            "E004",
-            0,
-            "find_duplicates",
-            {"analysis_type": "exact_row", "duplicate_row_count": 80},
-        ),
-        ("E005", 0, "compare_rows_by_key", {"record_mismatch_count": 0}),
-        (
-            "E006",
-            1,
-            "compare_aggregates",
-            {"aggregation": "sum", "signed_difference_a_minus_b": 726530.49},
-        ),
-    ]
+def test_controller_rejects_acceptance_without_a_valid_evidence_citation():
     state = InvestigationState(
-        investigation_id="complete-offsetting",
-        question="Identify every cause and calculate the net amount difference.",
+        investigation_id="citation-contract",
+        question="Why do these files differ?",
         dataset_paths=["source.csv", "target.csv"],
         evidence=[
             EvidenceItem(
-                evidence_id=evidence_id,
-                attempt=attempt_number,
-                finding="deterministic evidence",
-                tool=tool,
-                supporting_details=details,
+                evidence_id="E001",
+                attempt=0,
+                finding="Deterministic comparison",
+                tool="compare_aggregates",
             )
-            for evidence_id, attempt_number, tool, details in evidence_specs
         ],
     )
     attempt = InvestigationAttempt(
-        findings=["Missing records and exact duplicates coexist."],
-        hypothesis=(
-            "Missing source records and exact duplicate target rows coexist; the "
-            "measured source-minus-target amount difference is 726,530.49."
-        ),
-        evidence_ids=["E002", "E004", "E005", "E006"],
-    )
-    over_demanding_rejection = VerificationResult(
-        verdict=Verdict.REJECT,
-        confidence=0.4,
-        reason="A decomposition of the independently measured net sum is required.",
-    )
-
-    guarded = apply_verification_guard(state, attempt, over_demanding_rejection)
-
-    assert guarded.verdict == Verdict.ACCEPT
-    assert guarded.confidence == 0.9
-    assert "complete deterministic evidence chain" in guarded.reason
-
-    attempt.hypothesis = "Missing records and duplicates produce a difference of 1.00."
-    still_rejected = apply_verification_guard(
-        state, attempt, over_demanding_rejection
-    )
-    assert still_rejected.verdict == Verdict.REJECT
-
-
-def test_controller_requires_and_validates_paired_segment_evidence():
-    profiles = [
-        DatasetProfile(
-            dataset=name,
-            path=name,
-            row_count=2,
-            columns=["record_id", "priority", "amount"],
-            data_types={"record_id": "int64", "priority": "object", "amount": "float64"},
-            null_counts={"record_id": 0, "priority": 0, "amount": 0},
-            duplicate_count=0,
-            unique_counts={"record_id": 2, "priority": 2, "amount": 2},
-            possible_identifier_columns=["record_id"],
-            numeric_columns=["record_id", "amount"],
-        )
-        for name in ("source.csv", "target.csv")
-    ]
-    base_evidence = [
-        EvidenceItem(
-            evidence_id="E001",
-            attempt=0,
-            finding="45 value mismatches",
-            tool="compare_record_values",
-            supporting_details={"value_mismatch_count": 45},
-        ),
-        *[
-            EvidenceItem(
-                evidence_id=f"E00{index}",
-                attempt=0,
-                finding="No unmatched rows",
-                tool="find_unmatched_records",
-                supporting_details={"unmatched_count": 0},
-            )
-            for index in (2, 3)
-        ],
-        *[
-            EvidenceItem(
-                evidence_id=f"E00{index}",
-                attempt=0,
-                finding="No exact duplicates",
-                tool="find_duplicates",
-                supporting_details={
-                    "analysis_type": "exact_row",
-                    "duplicate_row_count": 0,
-                },
-            )
-            for index in (4, 5)
-        ],
-    ]
-    segment_results = (
-        [{"priority": "2-HIGH", "value": 100.0}, {"priority": "1-URGENT", "value": 50.0}],
-        [{"priority": "2-HIGH", "value": 123.5}, {"priority": "1-URGENT", "value": 50.0}],
-    )
-    segment_evidence = [
-        EvidenceItem(
-            evidence_id=f"E00{index}",
-            attempt=1,
-            finding="Paired priority totals",
-            tool="segment_analysis",
-            supporting_details={
-                "dataset": dataset,
-                "grouping": ["priority"],
-                "metric_column": "amount",
-                "aggregation": "sum",
-                "filtered_record_count": 2,
-                "results": results,
-                "results_truncated": False,
-            },
-        )
-        for index, dataset, results in zip(
-            (6, 7), ("source.csv", "target.csv"), segment_results
-        )
-    ]
-    state = InvestigationState(
-        investigation_id="segment-guard",
-        question="Which priority contains the amount difference?",
-        dataset_paths=["source.csv", "target.csv"],
-        dataset_profiles=profiles,
-        evidence=[*base_evidence, *segment_evidence],
+        hypothesis="The files differ.", evidence_ids=["E999"]
     )
     accepted = VerificationResult(
-        verdict=Verdict.ACCEPT,
-        confidence=0.95,
-        reason="Accepted by the verifier.",
-    )
-    wrong_attempt = InvestigationAttempt(
-        hypothesis="The amount difference is in 1-URGENT.",
-        evidence_ids=["E001", "E006", "E007"],
+        verdict=Verdict.ACCEPT, confidence=0.9, reason="Supported."
     )
 
-    guarded_wrong = apply_verification_guard(state, wrong_attempt, accepted)
+    guarded = apply_verification_guard(state, attempt, accepted)
 
-    assert guarded_wrong.verdict == Verdict.REJECT
-    assert "does not match the paired segment totals" in guarded_wrong.reason
+    assert guarded.verdict == Verdict.REJECT
+    assert "valid evidence citation" in guarded.reason
 
-    correct_attempt = InvestigationAttempt(
-        hypothesis="The amount difference is isolated to 2-HIGH.",
-        evidence_ids=["E001", "E006", "E007"],
+
+def test_controller_leaves_semantic_judgment_to_verifier():
+    state = InvestigationState(
+        investigation_id="semantic-verifier",
+        question="Which priority contains the amount difference?",
+        dataset_paths=["source.csv", "target.csv"],
+        evidence=[
+            EvidenceItem(
+                evidence_id="E001",
+                attempt=1,
+                finding="Paired priority totals",
+                tool="segment_analysis",
+            )
+        ],
     )
-    over_demanding_rejection = VerificationResult(
+    attempt = InvestigationAttempt(
+        hypothesis="The amount difference is in 1-URGENT.", evidence_ids=["E001"]
+    )
+    rejection = VerificationResult(
         verdict=Verdict.REJECT,
-        confidence=0.4,
-        reason="More localization is required.",
+        confidence=0.9,
+        reason="The cited totals contradict the conclusion.",
     )
-    guarded_correct = apply_verification_guard(
-        state, correct_attempt, over_demanding_rejection
+    acceptance = VerificationResult(
+        verdict=Verdict.ACCEPT,
+        confidence=0.9,
+        reason="The cited totals support the conclusion.",
     )
 
-    assert guarded_correct.verdict == Verdict.ACCEPT
-    assert "paired `priority` totals isolate" in guarded_correct.reason
+    assert apply_verification_guard(state, attempt, rejection) == rejection
+    assert apply_verification_guard(state, attempt, acceptance) == acceptance
 
 
 class AcceptingRuntime:
@@ -305,7 +190,7 @@ def test_attempt_limit_produces_inconclusive(datasets):
     assert "Confidence: Low" in result.report
 
 
-def test_controller_rejects_unsupported_technical_cause(datasets):
+def test_verifier_rejects_unsupported_technical_cause(datasets):
     class UnsafeRuntime(AcceptingRuntime):
         def investigate(self, state, previous_verification):
             attempt = super().investigate(state, previous_verification)
@@ -314,9 +199,10 @@ def test_controller_rejects_unsupported_technical_cause(datasets):
 
         def verify(self, state, attempt):
             return VerificationResult(
-                verdict=Verdict.ACCEPT,
-                confidence=0.95,
-                reason="Accepted by the model verifier.",
+                verdict=Verdict.REJECT,
+                confidence=0.2,
+                reason="The technical mechanism is not supported by CSV evidence.",
+                missing_evidence=["State only the supported data-level finding."],
             )
 
         def report(self, state, conclusive):
@@ -329,10 +215,40 @@ def test_controller_rejects_unsupported_technical_cause(datasets):
     assert result.state.attempt_count == 3
     assert result.state.verification.verdict == Verdict.REJECT
     assert "Root Cause: Inconclusive" in result.report
-    assert "Controller overruled verifier" in result.trace
+    assert "Controller overruled verifier" not in result.trace
 
 
-def test_complete_clean_match_skips_llm_roles(tmp_path):
+class BaselineUsingRuntime:
+    def __init__(self, hypothesis: str):
+        self.hypothesis = hypothesis
+        self.review_calls = 0
+        self.investigate_calls = 0
+        self.verify_calls = 0
+
+    def review_profiles(self, state):
+        self.review_calls += 1
+
+    def investigate(self, state, previous_verification):
+        self.investigate_calls += 1
+        return InvestigationAttempt(
+            findings=[self.hypothesis],
+            hypothesis=self.hypothesis,
+            evidence_ids=[item.evidence_id for item in state.evidence],
+        )
+
+    def verify(self, state, attempt):
+        self.verify_calls += 1
+        return VerificationResult(
+            verdict=Verdict.ACCEPT,
+            confidence=0.95,
+            reason="The cited baseline evidence supports the data-level finding.",
+        )
+
+    def report(self, state, conclusive):
+        return CrewAIRuntime.report(self, state, conclusive)
+
+
+def test_complete_clean_match_runs_both_agents_without_extra_tools(tmp_path):
     source = tmp_path / "source.csv"
     target = tmp_path / "target.csv"
     frame = pd.DataFrame(
@@ -345,31 +261,21 @@ def test_complete_clean_match_skips_llm_roles(tmp_path):
     frame.to_csv(source, index=False)
     frame.to_csv(target, index=False)
 
-    class CleanRuntime:
-        def review_profiles(self, state):
-            return None
-
-        def investigate(self, state, previous_verification):
-            raise AssertionError("Investigator must not run for a proven clean match")
-
-        def verify(self, state, attempt):
-            raise AssertionError("Verifier must not run for a proven clean match")
-
-        def report(self, state, conclusive):
-            assert conclusive is True
-            return "Root Cause: No discrepancy detected within the validated scope."
-
+    runtime = BaselineUsingRuntime("No discrepancy detected within the validated scope.")
     result = ReconAIInvestigationFlow(
         "Do these files disagree?",
         [str(source), str(target)],
-        runtime=CleanRuntime(),
+        runtime=runtime,
     ).run()
-    assert result.state.attempt_count == 0
+    assert result.state.attempt_count == 1
     assert result.state.verification.verdict == Verdict.ACCEPT
-    assert "without an LLM call" in result.trace
+    assert runtime.investigate_calls == 1
+    assert runtime.verify_calls == 1
+    assert all(item.attempt == 0 for item in result.state.evidence)
+    assert "collected 0 new evidence item(s)" in result.trace
 
 
-def test_proven_missing_records_skip_llm_roles(tmp_path):
+def test_proven_missing_records_run_both_agents_without_extra_tools(tmp_path):
     source = tmp_path / "source.csv"
     target = tmp_path / "target.csv"
     pd.DataFrame(
@@ -379,30 +285,21 @@ def test_proven_missing_records_skip_llm_roles(tmp_path):
         {"record_id": [1], "amount": [10.0]}
     ).to_csv(target, index=False)
 
-    class NoLLMRuntime:
-        def review_profiles(self, state):
-            return None
-
-        def investigate(self, state, previous_verification):
-            raise AssertionError("Investigator must not run for proven missing records")
-
-        def verify(self, state, attempt):
-            raise AssertionError("Verifier must not run for proven missing records")
-
-        def report(self, state, conclusive):
-            assert conclusive is True
-            return state.hypothesis
-
+    runtime = BaselineUsingRuntime(
+        "One record_id value in source.csv is absent from target.csv."
+    )
     result = ReconAIInvestigationFlow(
         "Why do the files disagree?",
         [str(source), str(target)],
-        runtime=NoLLMRuntime(),
+        runtime=runtime,
     ).run()
-    assert result.state.attempt_count == 0
+    assert result.state.attempt_count == 1
     assert "absent" in result.state.hypothesis
+    assert runtime.investigate_calls == runtime.verify_calls == 1
+    assert all(item.attempt == 0 for item in result.state.evidence)
 
 
-def test_proven_duplicate_records_skip_llm_roles(tmp_path):
+def test_proven_duplicate_records_run_both_agents_without_extra_tools(tmp_path):
     source = tmp_path / "source.csv"
     target = tmp_path / "target.csv"
     pd.DataFrame(
@@ -412,30 +309,21 @@ def test_proven_duplicate_records_skip_llm_roles(tmp_path):
         {"record_id": [1, 2, 2], "amount": [10.0, 20.0, 20.0]}
     ).to_csv(target, index=False)
 
-    class NoLLMRuntime:
-        def review_profiles(self, state):
-            return None
-
-        def investigate(self, state, previous_verification):
-            raise AssertionError("Investigator must not run for proven duplicates")
-
-        def verify(self, state, attempt):
-            raise AssertionError("Verifier must not run for proven duplicates")
-
-        def report(self, state, conclusive):
-            assert conclusive is True
-            return state.hypothesis
-
+    runtime = BaselineUsingRuntime(
+        "target.csv contains an extra exact duplicate record."
+    )
     result = ReconAIInvestigationFlow(
         "Why do the files disagree?",
         [str(source), str(target)],
-        runtime=NoLLMRuntime(),
+        runtime=runtime,
     ).run()
-    assert result.state.attempt_count == 0
+    assert result.state.attempt_count == 1
     assert "duplicate" in result.state.hypothesis
+    assert runtime.investigate_calls == runtime.verify_calls == 1
+    assert all(item.attempt == 0 for item in result.state.evidence)
 
 
-def test_proven_value_drift_skips_llm_roles(tmp_path):
+def test_proven_value_drift_runs_both_agents_without_extra_tools(tmp_path):
     source = tmp_path / "source.csv"
     target = tmp_path / "target.csv"
     pd.DataFrame(
@@ -445,27 +333,18 @@ def test_proven_value_drift_skips_llm_roles(tmp_path):
         {"record_id": [1, 2], "amount": [10.0, 25.0]}
     ).to_csv(target, index=False)
 
-    class NoLLMRuntime:
-        def review_profiles(self, state):
-            return None
-
-        def investigate(self, state, previous_verification):
-            raise AssertionError("Investigator must not run for proven value drift")
-
-        def verify(self, state, attempt):
-            raise AssertionError("Verifier must not run for proven value drift")
-
-        def report(self, state, conclusive):
-            assert conclusive is True
-            return state.hypothesis
-
+    runtime = BaselineUsingRuntime(
+        "One matched record contains a different amount value."
+    )
     result = ReconAIInvestigationFlow(
         "Why do the files disagree?",
         [str(source), str(target)],
-        runtime=NoLLMRuntime(),
+        runtime=runtime,
     ).run()
-    assert result.state.attempt_count == 0
+    assert result.state.attempt_count == 1
     assert "amount" in result.state.hypothesis
+    assert runtime.investigate_calls == runtime.verify_calls == 1
+    assert all(item.attempt == 0 for item in result.state.evidence)
 
 
 def test_localization_question_uses_agent_after_value_drift(tmp_path):
@@ -566,32 +445,24 @@ def test_one_to_many_key_coverage_sticks_to_requested_scope(tmp_path):
         }
     ).to_csv(events, index=False)
 
-    class CoverageRuntime:
-        def review_profiles(self, state):
-            return None
-
-        def investigate(self, state, previous_verification):
-            raise AssertionError("A complete key-coverage question should not need an LLM")
-
-        def verify(self, state, attempt):
-            raise AssertionError("A complete key-coverage question should not need an LLM")
-
-        def report(self, state, conclusive):
-            assert conclusive is True
-            return CrewAIRuntime.report(self, state, conclusive)
-
+    runtime = BaselineUsingRuntime(
+        "One record_id value in entities.csv is absent from events.csv; all event "
+        "record_id values have a matching entity."
+    )
     question = (
         "Compare unique record_id coverage only. Repeated record_id values in events.csv "
         "are valid, so do not classify them as duplicate errors. Identify entities with "
         "no corresponding event and event IDs with no entity."
     )
     result = ReconAIInvestigationFlow(
-        question, [str(entities), str(events)], runtime=CoverageRuntime()
+        question, [str(entities), str(events)], runtime=runtime
     ).run()
 
     relationships = result.state.dataset_profiles[0].possible_relationships
     assert relationships[0]["cardinality"] == "one_to_many"
-    assert result.state.attempt_count == 0
+    assert result.state.attempt_count == 1
+    assert runtime.investigate_calls == runtime.verify_calls == 1
+    assert all(item.attempt == 0 for item in result.state.evidence)
     assert "`entities.csv` has **1** `record_id` value" in result.report
     assert "All `record_id` values in `events.csv` have a matching record" in result.report
     assert "| Record ID | Status | Created at |" in result.report
@@ -628,26 +499,19 @@ def test_normal_key_question_returns_identifier_and_context_without_schema_instr
         }
     ).to_csv(payments, index=False)
 
-    class DeterministicRuntime:
-        def review_profiles(self, state):
-            return None
-
-        def investigate(self, state, previous_verification):
-            raise AssertionError("The baseline evidence fully answers this question")
-
-        def verify(self, state, attempt):
-            raise AssertionError("The baseline evidence fully answers this question")
-
-        def report(self, state, conclusive):
-            return CrewAIRuntime.report(self, state, conclusive)
-
+    runtime = BaselineUsingRuntime(
+        "One order_id value in orders.csv is absent from payments.csv; all payment "
+        "order_id values have a matching order."
+    )
     result = ReconAIInvestigationFlow(
         "Which order IDs have no corresponding payment, and which payment IDs have no order?",
         [str(orders), str(payments)],
-        runtime=DeterministicRuntime(),
+        runtime=runtime,
     ).run()
 
-    assert result.state.attempt_count == 0
+    assert result.state.attempt_count == 1
+    assert runtime.investigate_calls == runtime.verify_calls == 1
+    assert all(item.attempt == 0 for item in result.state.evidence)
     assert "`orders.csv` has **1** `order_id` value" in result.report
     assert "| Order ID | Order status | Order purchase timestamp |" in result.report
     assert "| --- | --- | --- |" in result.report
@@ -659,7 +523,7 @@ def test_normal_key_question_returns_identifier_and_context_without_schema_instr
     assert "Review ingestion and processing logs around `2024-01-02 11:00:00`" in result.report
 
 
-def test_broad_question_resolves_simple_one_to_many_key_gap_without_llm(tmp_path):
+def test_broad_question_resolves_simple_one_to_many_key_gap_with_both_agents(tmp_path):
     orders = tmp_path / "orders.csv"
     payments = tmp_path / "payments.csv"
     pd.DataFrame(
@@ -677,26 +541,19 @@ def test_broad_question_resolves_simple_one_to_many_key_gap_without_llm(tmp_path
         }
     ).to_csv(payments, index=False)
 
-    class DeterministicRuntime:
-        def review_profiles(self, state):
-            return None
-
-        def investigate(self, state, previous_verification):
-            raise AssertionError("A simple verified key gap should not depend on an LLM")
-
-        def verify(self, state, attempt):
-            raise AssertionError("A simple verified key gap should not depend on an LLM")
-
-        def report(self, state, conclusive):
-            return CrewAIRuntime.report(self, state, conclusive)
-
+    runtime = BaselineUsingRuntime(
+        "One order_id value in orders.csv is absent from payments.csv; all payment "
+        "order_id values have a matching order."
+    )
     result = ReconAIInvestigationFlow(
         "Investigate why these datasets disagree and show the affected records.",
         [str(orders), str(payments)],
-        runtime=DeterministicRuntime(),
+        runtime=runtime,
     ).run()
 
-    assert result.state.attempt_count == 0
+    assert result.state.attempt_count == 1
+    assert runtime.investigate_calls == runtime.verify_calls == 1
+    assert all(item.attempt == 0 for item in result.state.evidence)
     assert "`orders.csv` has **1** `order_id` value" in result.report
     assert "| B | delivered | 2024-01-02 |" in result.report
     assert "Finding confirmed from uploaded files" in result.report

@@ -79,6 +79,11 @@ def investigate(files: list[str] | None, question: str) -> tuple[str, str]:
         )
 
 
+def clear_previous_results() -> tuple[str, str]:
+    """Remove the previous run before a new queued investigation begins."""
+    return "", ""
+
+
 def build_interface() -> gr.Blocks:
     with gr.Blocks(title="ReconAI") as demo:
         gr.Markdown(
@@ -108,7 +113,16 @@ def build_interface() -> gr.Blocks:
             lines=14,
             interactive=False,
         )
-        button.click(investigate, inputs=[uploads, question], outputs=[report, trace])
+        clear_event = button.click(
+            clear_previous_results,
+            outputs=[report, trace],
+            queue=False,
+        )
+        clear_event.then(
+            investigate,
+            inputs=[uploads, question],
+            outputs=[report, trace],
+        )
     return demo
 
 

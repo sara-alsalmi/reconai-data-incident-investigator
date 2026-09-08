@@ -206,6 +206,200 @@ def find_duplicates(
     }
 
 
+def reconcile_record_set_contributions(
+    dataset_a_path: str | Path,
+    dataset_b_path: str | Path,
+    key_column_a: str,
+    key_column_b: str,
+    metric_column_a: str,
+    metric_column_b: str,
+    tolerance: float = 0.01,
+) -> dict:
+    """Decompose a numeric total difference into record-set contributions.
+
+    The calculation is schema-driven. It separates keys found on only one side,
+    extra exact copies of rows that also exist on the other side, and any remaining
+    difference among shared keys. Exact-copy comparison uses mapped key/metric
+    columns plus every other same-named column shared by the two CSV files.
+    """
+    if tolerance < 0:
+        raise ToolInputError("Tolerance must be zero or greater")
+    frame_a = load_csv(dataset_a_path)
+    frame_b = load_csv(dataset_b_path)
+    name_a = Path(dataset_a_path).name
+    name_b = Path(dataset_b_path).name
+    require_columns(frame_a, [key_column_a, metric_column_a], name_a)
+    require_columns(frame_b, [key_column_b, metric_column_b], name_b)
+    if not pd.api.types.is_numeric_dtype(frame_a[metric_column_a]) or not pd.api.types.is_numeric_dtype(
+        frame_b[metric_column_b]
+    ):
+        raise ToolInputError("Contribution metrics must be numeric in both datasets")
+
+    valid_a = frame_a.loc[frame_a[key_column_a].notna()].copy()
+    valid_b = frame_b.loc[frame_b[key_column_b].notna()].copy()
+    keys_a = set(valid_a[key_column_a].tolist())
+    keys_b = set(valid_b[key_column_b].tolist())
+    only_a = valid_a.loc[~valid_a[key_column_a].isin(keys_b)].copy()
+    only_b = valid_b.loc[~valid_b[key_column_b].isin(keys_a)].copy()
+    shared_a = valid_a.loc[valid_a[key_column_a].isin(keys_b)].copy()
+    shared_b = valid_b.loc[valid_b[key_column_b].isin(keys_a)].copy()
+
+    context_columns = [
+        column
+        for column in frame_a.columns
+        if column in frame_b.columns
+        and column not in {key_column_a, key_column_b, metric_column_a, metric_column_b}
+    ]
+
+    def canonical(
+        frame: pd.DataFrame, key_column: str, metric_column: str
+    ) -> pd.DataFrame:
+        result = pd.DataFrame(
+            {
+                "__key": frame[key_column],
+                "__metric": frame[metric_column],
+            }
+        )
+        for column in context_columns:
+            result[column] = frame[column]
+        return result
+
+    fingerprint_columns = ["__key", "__metric", *context_columns]
+    counts_a = (
+        canonical(shared_a, key_column_a, metric_column_a)
+        .groupby(fingerprint_columns, dropna=False, sort=False)
+        .size()
+        .rename("__count_a")
+        .reset_index()
+    )
+    counts_b = (
+        canonical(shared_b, key_column_b, metric_column_b)
+        .groupby(fingerprint_columns, dropna=False, sort=False)
+        .size()
+        .rename("__count_b")
+        .reset_index()
+    )
+    multiplicities = counts_a.merge(
+        counts_b, on=fingerprint_columns, how="outer"
+    ).fillna({"__count_a": 0, "__count_b": 0})
+    both_present = (
+        multiplicities["__count_a"].gt(0)
+        & multiplicities["__count_b"].gt(0)
+    )
+    multiplicities["__extra_a"] = (
+        multiplicities["__count_a"] - multiplicities["__count_b"]
+    ).clip(lower=0).where(both_present, 0).astype(int)
+    multiplicities["__extra_b"] = (
+        multiplicities["__count_b"] - multiplicities["__count_a"]
+    ).clip(lower=0).where(both_present, 0).astype(int)
+    extra_a = multiplicities.loc[multiplicities["__extra_a"].gt(0)].copy()
+    extra_b = multiplicities.loc[multiplicities["__extra_b"].gt(0)].copy()
+
+    def metric_sum(frame: pd.DataFrame, column: str) -> float:
+        return round(float(frame[column].sum()), 6)
+
+    def extra_metric_sum(frame: pd.DataFrame, count_column: str) -> float:
+        if frame.empty:
+            return 0.0
+        values = frame["__metric"].fillna(0) * frame[count_column]
+        return round(float(values.sum()), 6)
+
+    def extra_preview(
+        frame: pd.DataFrame, count_column: str, key_column: str, metric_column: str
+    ) -> list[dict]:
+        preview: list[dict] = []
+        for _, row in frame.head(MAX_SAMPLE_ITEMS).iterrows():
+            count = int(row[count_column])
+            metric = json_safe(row["__metric"])
+            preview.append(
+                {
+                    key_column: json_safe(row["__key"]),
+                    "extra_copy_count": count,
+                    metric_column: metric,
+                    "extra_metric_sum": None
+                    if metric is None
+                    else round(float(metric) * count, 6),
+                }
+            )
+        return preview
+
+    only_a_sum = metric_sum(only_a, metric_column_a)
+    only_b_sum = metric_sum(only_b, metric_column_b)
+    extra_a_sum = extra_metric_sum(extra_a, "__extra_a")
+    extra_b_sum = extra_metric_sum(extra_b, "__extra_b")
+    shared_difference = round(
+        metric_sum(shared_a, metric_column_a)
+        - metric_sum(shared_b, metric_column_b),
+        6,
+    )
+    shared_residual = round(
+        shared_difference - extra_a_sum + extra_b_sum,
+        6,
+    )
+    total_a = metric_sum(frame_a, metric_column_a)
+    total_b = metric_sum(frame_b, metric_column_b)
+    net_difference = round(total_a - total_b, 6)
+    explained_difference = round(
+        only_a_sum - only_b_sum + extra_a_sum - extra_b_sum + shared_residual,
+        6,
+    )
+    reconciliation_residual = round(net_difference - explained_difference, 6)
+
+    return {
+        "dataset_a": name_a,
+        "dataset_b": name_b,
+        "key_column_a": key_column_a,
+        "key_column_b": key_column_b,
+        "metric_column_a": metric_column_a,
+        "metric_column_b": metric_column_b,
+        "dataset_a_total": total_a,
+        "dataset_b_total": total_b,
+        "net_difference_a_minus_b": net_difference,
+        "dataset_a_only_unique_key_count": int(only_a[key_column_a].nunique()),
+        "dataset_a_only_row_count": int(len(only_a)),
+        "dataset_a_only_metric_sum": only_a_sum,
+        "dataset_b_only_unique_key_count": int(only_b[key_column_b].nunique()),
+        "dataset_b_only_row_count": int(len(only_b)),
+        "dataset_b_only_metric_sum": only_b_sum,
+        "dataset_a_extra_exact_copy_count": int(extra_a["__extra_a"].sum()),
+        "dataset_a_extra_exact_copy_key_count": int(extra_a["__key"].nunique()),
+        "dataset_a_extra_exact_copy_metric_sum": extra_a_sum,
+        "dataset_b_extra_exact_copy_count": int(extra_b["__extra_b"].sum()),
+        "dataset_b_extra_exact_copy_key_count": int(extra_b["__key"].nunique()),
+        "dataset_b_extra_exact_copy_metric_sum": extra_b_sum,
+        "shared_key_residual_metric_difference_a_minus_b": shared_residual,
+        "explained_difference_a_minus_b": explained_difference,
+        "reconciliation_residual": reconciliation_residual,
+        "arithmetic_reconciles": abs(reconciliation_residual) <= tolerance,
+        "fully_explained_by_key_gaps_and_exact_copies": abs(shared_residual) <= tolerance,
+        "exact_copy_scope_columns": [
+            key_column_a,
+            metric_column_a,
+            *context_columns,
+        ],
+        "sample_dataset_a_only_identifiers": compact_values(only_a[key_column_a]),
+        "sample_dataset_b_only_identifiers": compact_values(only_b[key_column_b]),
+        "sample_dataset_a_extra_exact_copies": extra_preview(
+            extra_a, "__extra_a", key_column_a, metric_column_a
+        ),
+        "sample_dataset_b_extra_exact_copies": extra_preview(
+            extra_b, "__extra_b", key_column_b, metric_column_b
+        ),
+        "samples_are_complete": {
+            "dataset_a_only": only_a[key_column_a].nunique() <= MAX_SAMPLE_ITEMS,
+            "dataset_b_only": only_b[key_column_b].nunique() <= MAX_SAMPLE_ITEMS,
+            "dataset_a_extra_exact_copies": extra_a["__key"].nunique()
+            <= MAX_SAMPLE_ITEMS,
+            "dataset_b_extra_exact_copies": extra_b["__key"].nunique()
+            <= MAX_SAMPLE_ITEMS,
+        },
+        "interpretation": (
+            "The arithmetic bridge describes observable row-set contributions only; "
+            "it does not establish the upstream technical cause."
+        ),
+    }
+
+
 def compare_record_values(
     dataset_a_path: str | Path,
     dataset_b_path: str | Path,

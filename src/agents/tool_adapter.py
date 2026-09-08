@@ -1,4 +1,4 @@
-"""Audited CrewAI wrappers around the six deterministic tools."""
+"""Audited CrewAI wrappers around ReconAI's deterministic tools."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from src.tools import (
     find_duplicates,
     find_unmatched_records,
     profile_dataset,
+    reconcile_record_set_contributions,
     segment_analysis,
 )
 
@@ -153,6 +154,13 @@ def _summarize(tool: str, result: dict) -> tuple[str, str | None, Any]:
             "filtered_record_count",
             result["filtered_record_count"],
         )
+    if tool == "reconcile_record_set_contributions":
+        return (
+            f"Reconciled record-set contributions; net {result['dataset_a']} minus "
+            f"{result['dataset_b']} is {result['net_difference_a_minus_b']}",
+            "net_difference_a_minus_b",
+            result["net_difference_a_minus_b"],
+        )
     count = result["affected_record_count"]
     record_word = "record" if count == 1 else "records"
     has_measured_impact = result.get("affected_amount_sum") is not None
@@ -268,6 +276,33 @@ def build_crewai_tools(state: InvestigationState) -> list[Any]:
             args,
             [dataset],
             lambda: find_duplicates(auditor.path(dataset), keys or None),
+        )
+
+    @tool("reconcile_record_set_contributions")
+    def reconcile_record_set_contributions_tool(
+        dataset_a: str,
+        dataset_b: str,
+        key_column_a: str,
+        key_column_b: str,
+        metric_column_a: str,
+        metric_column_b: str,
+        tolerance: float = 0.01,
+    ) -> str:
+        """Explain a numeric A-minus-B total using one-sided keys, extra exact copies, and any shared-key residual."""
+        args = locals().copy()
+        return auditor.execute(
+            "reconcile_record_set_contributions",
+            args,
+            [dataset_a, dataset_b],
+            lambda: reconcile_record_set_contributions(
+                auditor.path(dataset_a),
+                auditor.path(dataset_b),
+                key_column_a,
+                key_column_b,
+                metric_column_a,
+                metric_column_b,
+                tolerance,
+            ),
         )
 
     @tool("compare_rows_by_key")
@@ -399,6 +434,7 @@ def build_crewai_tools(state: InvestigationState) -> list[Any]:
         find_unmatched_records_tool,
         compare_record_values_tool,
         find_duplicates_tool,
+        reconcile_record_set_contributions_tool,
         compare_rows_by_key_tool,
         segment_analysis_tool,
         calculate_business_impact_tool,

@@ -137,7 +137,13 @@ def build(output: Path, scale_factor: float = 0.01) -> list[str]:
         {
             "outcome": "duplicate_records",
             "required_terms": ["duplicate", "duplicated"],
-            "forbidden_hypothesis_terms": ["pipeline", "etl", "software", "ingestion"],
+            "forbidden_hypothesis_terms": [
+                "pipeline",
+                "etl",
+                "software",
+                "ingestion",
+                "propagat",
+            ],
             "extra_record_count": len(duplicate_seed),
             "duplicate_record_count_including_originals": len(duplicate_seed) * 2,
             "excess_amount": round(float(duplicate_seed["total_amount"].sum()), 2),
@@ -203,11 +209,11 @@ def build(output: Path, scale_factor: float = 0.01) -> list[str]:
     offset_warehouse = pd.concat(
         [offset_warehouse, offset_duplicate_seed], ignore_index=True
     )
-    offset_value_difference = round(
-        float(offset_missing["total_amount"].sum())
-        - float(offset_duplicate_seed["total_amount"].sum()),
-        2,
+    offset_missing_sum = round(float(offset_missing["total_amount"].sum()), 2)
+    offset_duplicate_sum = round(
+        float(offset_duplicate_seed["total_amount"].sum()), 2
     )
+    offset_value_difference = round(offset_missing_sum - offset_duplicate_sum, 2)
     _write_case(
         output,
         "agentic_offsetting_missing_duplicates",
@@ -223,10 +229,30 @@ def build(output: Path, scale_factor: float = 0.01) -> list[str]:
             ],
             "semantic_scope": "hypothesis",
             "required_verdict": "ACCEPT",
-            "forbidden_hypothesis_terms": ["pipeline", "etl", "software", "ingestion"],
+            "forbidden_hypothesis_terms": [
+                "pipeline",
+                "etl",
+                "software",
+                "ingestion",
+                "propagat",
+            ],
             "min_attempts": 1,
             "min_agent_tool_calls": 1,
-            "required_agent_tools": {"compare_aggregates": 1},
+            "required_agent_tools": {
+                "compare_aggregates": 1,
+                "reconcile_record_set_contributions": 1,
+            },
+            "required_report_terms": [
+                f"{offset_missing_sum:,.2f}",
+                f"{offset_duplicate_sum:,.2f}",
+                f"{offset_value_difference:,.2f}",
+                "extra exact copies",
+                "net difference",
+            ],
+            "forbidden_report_phrases": [
+                "duplicates do not account for the value gap",
+                "duplicates do not account for the missing key set or the value gap",
+            ],
             "missing_record_count": len(offset_missing),
             "duplicate_record_count_including_originals": len(offset_duplicate_seed) * 2,
             "difference_source_minus_warehouse": offset_value_difference,
@@ -260,6 +286,30 @@ def build(output: Path, scale_factor: float = 0.01) -> list[str]:
                         "metric_column_b": "total_amount",
                     },
                 },
+                {
+                    "tool": "reconcile_record_set_contributions",
+                    "field": "dataset_a_only_metric_sum",
+                    "value": offset_missing_sum,
+                    "attempt_min": 1,
+                },
+                {
+                    "tool": "reconcile_record_set_contributions",
+                    "field": "dataset_b_extra_exact_copy_count",
+                    "value": len(offset_duplicate_seed),
+                    "attempt_min": 1,
+                },
+                {
+                    "tool": "reconcile_record_set_contributions",
+                    "field": "dataset_b_extra_exact_copy_metric_sum",
+                    "value": offset_duplicate_sum,
+                    "attempt_min": 1,
+                },
+                {
+                    "tool": "reconcile_record_set_contributions",
+                    "field": "arithmetic_reconciles",
+                    "value": True,
+                    "attempt_min": 1,
+                },
             ],
         },
     )
@@ -282,7 +332,15 @@ def build(output: Path, scale_factor: float = 0.01) -> list[str]:
             "required_all_terms": ["2-high"],
             "semantic_scope": "hypothesis",
             "required_verdict": "ACCEPT",
-            "forbidden_hypothesis_terms": ["pipeline", "etl", "software", "ingestion"],
+            "forbidden_hypothesis_terms": [
+                "pipeline",
+                "etl",
+                "software",
+                "ingestion",
+                "surcharge",
+                "fee being applied",
+                "pricing rule",
+            ],
             "min_attempts": 1,
             "min_agent_tool_calls": 2,
             "required_agent_tools": {"segment_analysis": 2},

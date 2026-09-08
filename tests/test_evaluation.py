@@ -17,6 +17,12 @@ def _result(hypothesis: str):
         question="Why are records missing?",
         dataset_paths=["source.csv", "warehouse.csv"],
         hypothesis=hypothesis,
+        attempt_count=1,
+        verification=VerificationResult(
+            verdict=Verdict.ACCEPT,
+            confidence=0.9,
+            reason="The cited evidence supports the finding.",
+        ),
         evidence=[
             EvidenceItem(
                 evidence_id="E001",
@@ -141,3 +147,23 @@ def test_agentic_evaluation_requires_matching_agent_tool_details():
     assert score["verdict_requirement_passed"] is True
     assert score["evidence_checks_passed"] is True
     assert score["passed"] is True
+
+
+def test_evaluation_rejects_incomplete_or_contradictory_report_content():
+    result = _result("Missing and duplicate records explain the difference.")
+    result.report = (
+        "The net difference is 100.00, but duplicates do not account for the value gap."
+    )
+    expected = {
+        "required_report_terms": ["300.00", "200.00", "100.00", "extra exact copies"],
+        "forbidden_report_phrases": ["duplicates do not account for the value gap"],
+    }
+
+    score = score_run(result, expected)
+
+    assert score["report_content_passed"] is False
+    assert score["passed"] is False
+    assert "300.00" in score["missing_required_report_terms"]
+    assert score["forbidden_report_phrases_found"] == [
+        "duplicates do not account for the value gap"
+    ]

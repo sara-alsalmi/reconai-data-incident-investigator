@@ -8,6 +8,7 @@ from src.tools.reconciliation import (
     compare_rows_by_key,
     find_duplicates,
     find_unmatched_records,
+    reconcile_record_set_contributions,
 )
 from src.tools.segmentation import segment_analysis
 
@@ -18,6 +19,7 @@ __all__ = [
     "compare_rows_by_key",
     "find_unmatched_records",
     "find_duplicates",
+    "reconcile_record_set_contributions",
     "segment_analysis",
     "calculate_business_impact",
 ]

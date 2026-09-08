@@ -32,7 +32,9 @@ def build_openrouter_llm(settings: Settings) -> Any:
     from crewai import LLM
 
     model = settings.openrouter_model
-    if not model.startswith("openrouter/"):
+    if model == "openrouter/free":
+        model = "openrouter/openrouter/free"
+    elif not model.startswith("openrouter/"):
         model = f"openrouter/{model}"
     return LLM(
         model=model,
@@ -195,6 +197,7 @@ def _question_focus_tools(question: str) -> set[str] | None:
                 "compare_record_values",
                 "compare_rows_by_key",
                 "calculate_business_impact",
+                "reconcile_record_set_contributions",
             }
         )
     if any(
@@ -214,6 +217,28 @@ def _question_focus_tools(question: str) -> set[str] | None:
         )
     ):
         tools.update({"segment_analysis", "calculate_business_impact"})
+    if any(
+        term in lowered
+        for term in (
+            "cause",
+            "causing",
+            "explain",
+            "why",
+            "identify",
+            "affected record",
+            "affected order",
+            "affected id",
+            "record-level",
+            "record level",
+        )
+    ):
+        tools.update(
+            {
+                "find_unmatched_records",
+                "find_duplicates",
+                "reconcile_record_set_contributions",
+            }
+        )
     return tools or None
 
 
@@ -364,6 +389,43 @@ def _affected_details_markdown(report_evidence: list[Any]) -> str:
             f"{header}\n{separator}\n" + "\n".join(rows)
         )
     for item in report_evidence:
+        if item.tool != "reconcile_record_set_contributions":
+            continue
+        details = item.supporting_details
+        completeness = details.get("samples_are_complete", {})
+        for side in ("a", "b"):
+            records = details.get(f"sample_dataset_{side}_extra_exact_copies") or []
+            if not records:
+                continue
+            dataset = details.get(f"dataset_{side}", f"dataset {side.upper()}")
+            key_count = int(
+                details.get(f"dataset_{side}_extra_exact_copy_key_count", 0)
+            )
+            copy_count = int(
+                details.get(f"dataset_{side}_extra_exact_copy_count", 0)
+            )
+            columns = list(records[0])
+            header = "| " + " | ".join(_markdown_header(column) for column in columns) + " |"
+            separator = "| " + " | ".join("---" for _ in columns) + " |"
+            rows = [
+                "| "
+                + " | ".join(_markdown_cell(record.get(column)) for column in columns)
+                + " |"
+                for record in records
+            ]
+            complete = completeness.get(f"dataset_{side}_extra_exact_copies", False)
+            description = (
+                f"Showing all {key_count} affected key values"
+                if complete
+                else f"Showing {len(records)} of {key_count} affected key values"
+            )
+            sections.append(
+                f"### `{dataset}` extra exact copies · {item.evidence_id}\n\n"
+                f"{description}. These keys account for {copy_count} extra "
+                f"{'copy' if copy_count == 1 else 'copies'} relative to the other file.\n\n"
+                f"{header}\n{separator}\n" + "\n".join(rows)
+            )
+    for item in report_evidence:
         if item.tool != "compare_record_values":
             continue
         details = item.supporting_details
@@ -394,6 +456,188 @@ def _affected_details_markdown(report_evidence: list[Any]) -> str:
     return "\n\n".join(sections)
 
 
+def _record_set_contribution_evidence(report_evidence: list[Any]) -> Any | None:
+    return next(
+        (
+            item
+            for item in reversed(report_evidence)
+            if item.tool == "reconcile_record_set_contributions"
+            and item.supporting_details.get("arithmetic_reconciles") is True
+        ),
+        None,
+    )
+
+
+def _signed_amount(value: float) -> str:
+    return f"{float(value):+,.2f}"
+
+
+def _record_set_contribution_answer(item: Any) -> str:
+    details = item.supporting_details
+    dataset_a = details["dataset_a"]
+    dataset_b = details["dataset_b"]
+    key_a = details["key_column_a"]
+    key_b = details["key_column_b"]
+    clauses: list[str] = []
+
+    def add_only(side: str, sign: int) -> None:
+        count = int(details.get(f"dataset_{side}_only_unique_key_count", 0))
+        if not count:
+            return
+        dataset = details[f"dataset_{side}"]
+        other = details["dataset_b" if side == "a" else "dataset_a"]
+        key = key_a if side == "a" else key_b
+        row_count = int(details.get(f"dataset_{side}_only_row_count", 0))
+        amount = float(details.get(f"dataset_{side}_only_metric_sum", 0.0)) * sign
+        clauses.append(
+            f"**{count}** `{key}` {'value' if count == 1 else 'values'} "
+            f"({row_count} {'row' if row_count == 1 else 'rows'}) exist only in "
+            f"`{dataset}`, contributing {_signed_amount(amount)} to "
+            f"`{dataset_a}` minus `{dataset_b}`"
+        )
+
+    def add_extra_copies(side: str, sign: int) -> None:
+        copies = int(details.get(f"dataset_{side}_extra_exact_copy_count", 0))
+        if not copies:
+            return
+        dataset = details[f"dataset_{side}"]
+        key = key_a if side == "a" else key_b
+        key_count = int(
+            details.get(f"dataset_{side}_extra_exact_copy_key_count", 0)
+        )
+        amount = (
+            float(details.get(f"dataset_{side}_extra_exact_copy_metric_sum", 0.0))
+            * sign
+        )
+        clauses.append(
+            f"`{dataset}` contains **{copies}** extra exact "
+            f"{'copy' if copies == 1 else 'copies'} across **{key_count}** `{key}` "
+            f"{'value' if key_count == 1 else 'values'}, contributing "
+            f"{_signed_amount(amount)}"
+        )
+
+    add_only("a", 1)
+    add_only("b", -1)
+    add_extra_copies("a", 1)
+    add_extra_copies("b", -1)
+    residual = float(
+        details.get("shared_key_residual_metric_difference_a_minus_b", 0.0)
+    )
+    if abs(residual) > 0.01:
+        clauses.append(
+            "remaining differences among shared keys contribute "
+            f"{_signed_amount(residual)}"
+        )
+    explanation = "; ".join(clauses) if clauses else "no record-set contribution was found"
+    net = float(details["net_difference_a_minus_b"])
+    closure = (
+        "The components reconcile exactly to"
+        if details.get("arithmetic_reconciles")
+        else "The measured components do not fully reconcile to"
+    )
+    return (
+        f"The total difference is explained at the data level as follows: {explanation}. "
+        f"{closure} a net `{dataset_a}` minus `{dataset_b}` difference of "
+        f"**{_signed_amount(net)}** ({item.evidence_id}). This identifies the observed "
+        "record-level conditions, but the CSV files do not establish their technical cause."
+    )
+
+
+def _record_set_contribution_table(item: Any | None) -> str:
+    if item is None:
+        return ""
+    details = item.supporting_details
+    dataset_a = details["dataset_a"]
+    dataset_b = details["dataset_b"]
+    rows: list[tuple[str, str, str]] = []
+
+    def append(label: str, count: int, effect: float) -> None:
+        if count:
+            rows.append((label, str(count), _signed_amount(effect)))
+
+    append(
+        f"Keys only in `{dataset_a}`",
+        int(details.get("dataset_a_only_unique_key_count", 0)),
+        float(details.get("dataset_a_only_metric_sum", 0.0)),
+    )
+    append(
+        f"Keys only in `{dataset_b}`",
+        int(details.get("dataset_b_only_unique_key_count", 0)),
+        -float(details.get("dataset_b_only_metric_sum", 0.0)),
+    )
+    append(
+        f"Extra exact copies in `{dataset_a}`",
+        int(details.get("dataset_a_extra_exact_copy_count", 0)),
+        float(details.get("dataset_a_extra_exact_copy_metric_sum", 0.0)),
+    )
+    append(
+        f"Extra exact copies in `{dataset_b}`",
+        int(details.get("dataset_b_extra_exact_copy_count", 0)),
+        -float(details.get("dataset_b_extra_exact_copy_metric_sum", 0.0)),
+    )
+    residual = float(
+        details.get("shared_key_residual_metric_difference_a_minus_b", 0.0)
+    )
+    if abs(residual) > 0.01:
+        rows.append(("Other shared-key differences", "—", _signed_amount(residual)))
+    if not rows:
+        return ""
+    body = "\n".join(f"| {label} | {count} | {effect} |" for label, count, effect in rows)
+    net = _signed_amount(float(details["net_difference_a_minus_b"]))
+    return (
+        "## Reconciliation\n\n"
+        f"Effects use `{dataset_a}` minus `{dataset_b}`.\n\n"
+        "| Component | Affected keys or copies | Effect |\n"
+        "| --- | ---: | ---: |\n"
+        f"{body}\n"
+        f"| **Net difference** |  | **{net}** |\n\n"
+    )
+
+
+def _paired_segment_localization(
+    report_evidence: list[Any],
+) -> tuple[str, Any, str, str] | None:
+    """Return a single segment isolated by complete paired aggregate evidence."""
+    segment_evidence = [
+        item
+        for item in report_evidence
+        if item.tool == "segment_analysis"
+        and len(item.supporting_details.get("grouping", [])) == 1
+        and not item.supporting_details.get("results_truncated")
+    ]
+    for index, left in enumerate(segment_evidence):
+        left_details = left.supporting_details
+        dimension = left_details["grouping"][0]
+        for right in segment_evidence[index + 1 :]:
+            right_details = right.supporting_details
+            if (
+                left_details.get("dataset") == right_details.get("dataset")
+                or left_details.get("grouping") != right_details.get("grouping")
+                or left_details.get("metric_column")
+                != right_details.get("metric_column")
+                or left_details.get("aggregation")
+                != right_details.get("aggregation")
+            ):
+                continue
+            left_values = {
+                row.get(dimension): float(row["value"])
+                for row in left_details.get("results", [])
+            }
+            right_values = {
+                row.get(dimension): float(row["value"])
+                for row in right_details.get("results", [])
+            }
+            differing = [
+                segment
+                for segment in left_values.keys() | right_values.keys()
+                if round(left_values.get(segment, 0.0) - right_values.get(segment, 0.0), 6)
+                != 0
+            ]
+            if len(differing) == 1:
+                return dimension, differing[0], left.evidence_id, right.evidence_id
+    return None
+
+
 def _direct_answer(
     state: InvestigationState, conclusive: bool, report_evidence: list[Any]
 ) -> str:
@@ -401,6 +645,48 @@ def _direct_answer(
         return (
             "The available evidence was not sufficient for a reliable conclusion. "
             "Review the evidence below before taking corrective action."
+        )
+    contribution = _record_set_contribution_evidence(report_evidence)
+    if contribution is not None:
+        return _record_set_contribution_answer(contribution)
+    value_mismatch = next(
+        (
+            item
+            for item in reversed(report_evidence)
+            if item.tool == "compare_record_values"
+            and item.supporting_details.get("value_mismatch_count", 0) > 0
+        ),
+        None,
+    )
+    if value_mismatch is not None:
+        details = value_mismatch.supporting_details
+        count = int(details["value_mismatch_count"])
+        key = details.get("key_column_a", "key")
+        metric = details.get("value_column_a", "value")
+        dataset_a = details.get("dataset_a", "dataset A")
+        dataset_b = details.get("dataset_b", "dataset B")
+        answer = (
+            f"**{count}** matched `{key}` {'value has' if count == 1 else 'values have'} "
+            f"different `{metric}` values between `{dataset_a}` and `{dataset_b}`"
+        )
+        difference = details.get("signed_difference_a_minus_b")
+        if isinstance(difference, (int, float)):
+            answer += (
+                f", contributing **{_signed_amount(float(difference))}** to "
+                f"`{dataset_a}` minus `{dataset_b}`"
+            )
+        answer += f" ({value_mismatch.evidence_id})."
+        localization = _paired_segment_localization(report_evidence)
+        if localization is not None:
+            dimension, segment, left_id, right_id = localization
+            answer += (
+                f" Complete paired totals isolate this aggregate difference to "
+                f"`{dimension}={segment}` ({left_id}/{right_id})."
+            )
+        return (
+            answer
+            + " This describes the observed data difference; the uploaded files do not "
+            "establish the technical mechanism that produced it."
         )
     hypothesis = state.hypothesis or "The performed checks did not establish a discrepancy."
     focus_tools = _question_focus_tools(state.question)
@@ -450,6 +736,25 @@ def _direct_answer(
 
 def _contextual_actions(report_evidence: list[Any], fallback: list[str]) -> list[str]:
     """Create actionable follow-up steps when an affected key is known."""
+    contribution = _record_set_contribution_evidence(report_evidence)
+    if contribution is not None:
+        details = contribution.supporting_details
+        dataset_a = details["dataset_a"]
+        dataset_b = details["dataset_b"]
+        only_a = int(details.get("dataset_a_only_unique_key_count", 0))
+        only_b = int(details.get("dataset_b_only_unique_key_count", 0))
+        extra_a = int(details.get("dataset_a_extra_exact_copy_key_count", 0))
+        extra_b = int(details.get("dataset_b_extra_exact_copy_key_count", 0))
+        return [
+            (
+                f"Review both affected sets: {only_a} keys only in `{dataset_a}`, "
+                f"{only_b} keys only in `{dataset_b}`, {extra_a} keys with extra exact "
+                f"copies in `{dataset_a}`, and {extra_b} in `{dataset_b}`."
+            ),
+            "Compare both files with their source-system and processing logs before "
+            "assigning a technical cause.",
+            "Correct or backfill records only after confirming the system of record.",
+        ]
     unmatched = [
         item
         for item in report_evidence
@@ -531,6 +836,7 @@ def _concise_evidence(report_evidence: list[Any]) -> list[str]:
         and bool(item.supporting_details.get("sample_unmatched_records"))
         for item in key_checks
     )
+    contribution = _record_set_contribution_evidence(report_evidence)
     if key_checks:
         keys = sorted(
             {
@@ -567,7 +873,32 @@ def _concise_evidence(report_evidence: list[Any]) -> list[str]:
             elif details.get("duplicate_row_count", 0) == 0:
                 exact_duplicate_zeros.append(item)
             else:
-                lines.append(f"{item.evidence_id} — {item.finding}.")
+                extra_count = 0
+                if contribution is not None:
+                    bridge = contribution.supporting_details
+                    if details.get("dataset") == bridge.get("dataset_a"):
+                        extra_count = int(
+                            bridge.get("dataset_a_extra_exact_copy_count", 0)
+                        )
+                    elif details.get("dataset") == bridge.get("dataset_b"):
+                        extra_count = int(
+                            bridge.get("dataset_b_extra_exact_copy_count", 0)
+                        )
+                if extra_count:
+                    lines.append(
+                        f"{item.evidence_id} — {details.get('duplicate_row_count', 0)} rows "
+                        "participate in exact duplicate groups; paired comparison identifies "
+                        f"{extra_count} extra {'copy' if extra_count == 1 else 'copies'}."
+                    )
+                else:
+                    lines.append(f"{item.evidence_id} — {item.finding}.")
+            continue
+        if item.tool == "reconcile_record_set_contributions":
+            lines.append(
+                f"{item.evidence_id} — Reconciled one-sided keys, extra exact copies, "
+                f"shared-key residuals, and the net `{details.get('dataset_a')}` minus "
+                f"`{details.get('dataset_b')}` total."
+            )
             continue
         if item.tool == "calculate_business_impact":
             if has_single_record_preview and details.get("affected_amount_sum") is None:
@@ -624,6 +955,7 @@ def _render_report(
         else "Low"
     )
     report_evidence = _report_evidence(state)
+    contribution = _record_set_contribution_evidence(report_evidence)
     fallback_actions = draft.recommended_actions or [
         "Collect the missing source-system evidence."
     ]
@@ -740,14 +1072,14 @@ def _render_report(
         if (
             segment
             and details.get("affected_record_count", 0) > 1
-            and (not strict_scope or segment_requested)
+            and (segment_requested or (not strict_scope and contribution is None))
         ):
             affected_segment = (
                 f"{segment['segment']} — {segment['record_count']} records "
                 f"({impact.evidence_id})"
             )
         period = details.get("affected_date_range")
-        if period and (not strict_scope or time_requested):
+        if period and (time_requested or (not strict_scope and contribution is None)):
             affected_period = (
                 f"{period['start']} to {period['end']} ({impact.evidence_id})"
             )
@@ -826,6 +1158,7 @@ def _render_report(
             f"{difference_evidence.evidence_id})"
         )
     answer = _direct_answer(state, conclusive, report_evidence)
+    contribution_section = _record_set_contribution_table(contribution)
     evidence_lines = _concise_evidence(report_evidence)
     evidence_md = "\n".join(f"- {item}" for item in evidence_lines)
     affected_details_md = _affected_details_markdown(report_evidence)
@@ -840,6 +1173,16 @@ def _render_report(
         if item.tool == "find_unmatched_records"
         and item.supporting_details.get("sample_unmatched_records")
     )
+    if contribution is not None:
+        previewed_unique_count += int(
+            contribution.supporting_details.get(
+                "dataset_a_extra_exact_copy_key_count", 0
+            )
+        ) + int(
+            contribution.supporting_details.get(
+                "dataset_b_extra_exact_copy_key_count", 0
+            )
+        )
     affected_heading = (
         "Affected record" if previewed_unique_count == 1 else "Affected records"
     )
@@ -908,13 +1251,14 @@ def _render_report(
     confidence_label = "Confidence in data finding" if conclusive else "Confidence"
     return f"""# Investigation Result
 
-> **Status:** {status} · **{confidence_label}:** {confidence}
+> **Status:** {status}<br>
+> **{confidence_label}:** {confidence}
 
 ## Answer
 
 {answer}
 
-{affected_details_section}{scope_section}{evidence_section}{uncertainty_section}{actions_section}
+{contribution_section}{affected_details_section}{scope_section}{evidence_section}{uncertainty_section}{actions_section}
 """
 
 
@@ -980,9 +1324,6 @@ class CrewAIRuntime:
     def investigate(
         self, state: InvestigationState, previous_verification: VerificationResult | None
     ) -> InvestigationAttempt:
-        from src.baseline import collect_question_required_evidence
-
-        collect_question_required_evidence(state)
         evidence = [
             _normalize_numbers(item.model_dump(mode="json")) for item in state.evidence
         ]
@@ -1005,19 +1346,18 @@ Dataset-aware evidence quality guide:
 
 The controller has already run mandatory count, bidirectional key, exact-duplicate, and
 full-shared-row checks for every inferred relationship. Interpret that existing evidence
-before calling anything. If it proves no discrepancy, stop without more tools and state only
-the checked scope. If it proves a discrepancy, use at most the few additional tools needed to
-localize its segment, time range, or measurable impact.
-
-The controller may also have added a question-required comparison during this attempt. Treat
-any evidence item whose attempt number matches the current attempt as fresh mandatory evidence,
-cite its evidence ID, and do not repeat that exact call.
+before calling anything. If the baseline already answers the question, make no additional tool
+call: cite the relevant baseline evidence and form the conclusion from it. If requested facts are
+still missing, use only the few additional deterministic tools needed to obtain them.
 
 The user does not need to describe table cardinality or prescribe tools. Infer intent from
 the natural-language question, profiles, filenames, shared keys, and observed cardinality.
 Unmatched-key evidence contains a bounded affected-record preview with automatically selected
 status/date/value context. When the user asks which records are affected, include the actual
 identifiers from that evidence; if the preview is truncated, explicitly call it a preview.
+Key absence proves only that the identifier has no matching row in the uploaded comparison file.
+Do not infer that the record is legitimate or invalid, or that the underlying real-world event
+did or did not occur.
 
 Choose useful tools yourself. All important numerical facts must come from tool calls.
 Treat the user's requested scope and explicit exclusions as binding requirements. Answer the
@@ -1036,7 +1376,9 @@ findings, a cautious data-level root-cause hypothesis, remaining uncertainty, an
 IDs that support it. The hypothesis itself must stop at the data-level explanation. Never put
 an ETL, pipeline, software, deletion, ingestion, or operational failure into the hypothesis
 unless direct evidence proves it; put possible technical mechanisms only in uncertainty or
-recommended follow-up. Association must not be stated as proven causation.
+recommended follow-up. Do not say a record failed or never propagated, loaded, transferred,
+or synchronized when the evidence proves only that it appears in one uploaded file.
+Association must not be stated as proven causation.
 
 Tool-choice rules for ambiguous cases:
 - Use the observed relationship cardinality in the dataset profiles. Raw row counts are not
@@ -1051,12 +1393,19 @@ Tool-choice rules for ambiguous cases:
   the two datasets. Do not substitute the row-count comparison for a value comparison.
 - When missing keys and duplicate keys coexist, describe both observed conditions. Do not
   assume duplicate-key rows are identical copies or assign part of an aggregate difference to
-  them unless direct evidence proves that. A whole-dataset aggregate comparison may establish
-  the net difference independently without decomposing it into unsupported components.
+  them unless direct evidence proves that. If the question asks what contributes to the net
+  difference, call reconcile_record_set_contributions. Use its one-sided key sums, extra
+  exact-copy sums, shared-key residual, and net value exactly. Distinguish rows participating
+  in duplicate groups from actual extra copies.
 - If the question asks which category contains a value discrepancy but does not ask when,
   call segment_analysis once for each dataset with the same category, metric, and aggregation;
-  leave date_column blank. Compare the corresponding category totals. Do not add a time grain
-  that the question did not request.
+  leave date_column blank and date_frequency blank. Compare the corresponding category totals.
+  Do not add a time grain that the question did not request. A result grouped by an extra date
+  field or marked results_truncated does not answer a category-only question; rerun the focused
+  comparison instead of drawing a conclusion from it.
+- A segment result's record_count is the full population of that segment unless the tool was
+  explicitly filtered to affected records. Do not report it as the affected-record count. Use
+  matched-value or unmatched-key evidence for the number of affected records.
 """
         return self._run_structured(self.investigator, prompt, InvestigationAttempt)
 
@@ -1103,21 +1452,28 @@ Verification rules:
   required to prove the deeper technical mechanism; record that as remaining uncertainty.
 - Key-absence evidence proves only that no matching key appears in the uploaded comparison
   file. It does not prove that a real-world transaction never occurred or that an entry was
-  deleted. Require the hypothesis to preserve that dataset-level boundary.
+  deleted, valid, or invalid. Require the hypothesis to preserve that dataset-level boundary.
 - A claimed affected segment is meaningful only when its source column has more than one
   value and tool evidence shows concentration. A constant status such as all "Captured" is
   not an affected segment.
 - For a reconciliation mismatch, check whether the numerical gap, key-level mismatch,
   informative segment, time range, and impact form a consistent explanation. Request the
   specific missing check when they do not.
-- Do not demand an unsupported decomposition of a net aggregate difference. When deterministic
-  evidence proves missing keys and duplicate keys coexist, and an independently calculated
-  whole-dataset sum proves the requested net difference, that evidence is sufficient for a
-  cautious data-level explanation of those observed conditions. The hypothesis must not claim
-  how much each condition contributed unless that contribution was measured.
+- Do not accept an unsupported decomposition of a net aggregate difference. When
+  reconcile_record_set_contributions evidence is supplied, verify that its component effects,
+  shared-key residual, and independently calculated net agree. Require the hypothesis to mention
+  every non-zero record-set condition and never confuse duplicate-group participation with the
+  number of extra copies.
 - Matching grouped totals from both datasets are valid evidence that other displayed segments
   do not contribute to a discrepancy. Do not require an additional row-level segment check when
   the paired full-dataset group results already isolate exactly one differing segment.
+- For a question asking which category contains a discrepancy, ACCEPT localization only from
+  paired, complete results grouped by exactly that requested category with the same metric and
+  aggregation. REJECT localization based on an additional unrequested time grain, truncated
+  group results, or inference from a small mismatch sample.
+- REJECT a conclusion that labels an unfiltered segment record_count as the number of affected
+  records, or claims how mismatches are distributed across categories without evidence mapping
+  the affected keys to those categories.
 """
         return self._run_structured(self.verifier, prompt, VerificationResult)
 

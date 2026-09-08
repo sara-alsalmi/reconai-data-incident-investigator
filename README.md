@@ -28,20 +28,22 @@ what the evidence supports.
 4. **Controller:** validates evidence references, limits retries, and returns an inconclusive result
    instead of an unsupported claim.
 
-Simple cases can finish from deterministic evidence. Ambiguous or multi-cause questions activate
-the Investigator and Verifier.
+The Investigator and Verifier run on every investigation. When baseline evidence already answers
+the question, the Investigator cites it without making unnecessary tool calls. Ambiguous or
+multi-cause questions trigger only the focused follow-up tools needed.
 
 ```mermaid
 flowchart LR
     A[CSV files + question] --> B[Profile and baseline]
-    B -->|Enough evidence| E[Clear report]
-    B -->|More analysis| C[Investigator]
-    C --> D[Verifier]
+    B --> C[Investigator]
+    C -->|Baseline is enough| D[Verifier]
+    C -->|Needs evidence| F[Focused deterministic tools]
+    F --> D
     D -->|Revise| C
-    D -->|Accept or limit reached| E
+    D -->|Accept or limit reached| E[Clear report]
 ```
 
-## What it can investigate
+## Where it can help
 
 - Missing identifiers in either direction
 - One-to-one and one-to-many relationships
@@ -49,31 +51,56 @@ flowchart LR
 - Numeric or categorical differences for matching records
 - Affected segments, date ranges, records, and measurable impact
 
-Typical uses include financial reconciliation, inventory checks, CRM-to-billing validation,
-source-to-warehouse comparison, and migration quality checks.
+Typical uses include financial reconciliation, inventory checks, CRM-to-billing validation, source-to-warehouse comparison, and migration quality checks.
 
-## Example
+ReconAI can work with previously unseen related CSV datasets when they contain enough shared structure to infer their relationships.
+
+## Example use
+
+Someone using ReconAI only needs to:
+
+1. Upload two or more related CSV files, such as source and warehouse exports, invoices and
+   payments, or customers and transactions.
+2. Ask a normal question without choosing columns or tools.
+3. Review the verified answer, affected-record table, supporting evidence, and any remaining
+   uncertainty.
+
+Example questions:
 
 ```text
 Investigate why these datasets disagree and show the affected records.
+
+Which IDs are missing from either file?
+
+The row counts match, but the totals do not. What is causing the difference?
 ```
 
-With the public Olist orders and payments datasets, ReconAI finds the single order ID with no
-matching payment. It correctly treats split payments as a valid one-to-many relationship rather
-than labeling them duplicate errors.
+ReconAI profiles the uploaded files, infers likely shared keys and relationships, selects the
+relevant checks, and produces a readable analyst report. It does not require the user to know a
+benchmark dataset or describe one-to-many behavior in the question.
 
-## Reliability and evaluation
+## Reliability
 
 - Important facts come from deterministic pandas tools, not model arithmetic.
 - Every reported finding is tied to an evidence ID.
+- Multi-cause reconciliations show a signed accounting bridge from one-sided keys,
+  extra exact copies, and shared-key differences to the verified net total.
 - Verification, bounded retries, and safe inconclusive results reduce unsupported conclusions.
-- Current results: **43/43 automated tests**, **12/12 repeated deterministic benchmark runs**, and
-  **2/2 agentic TPC-H cases** in the latest single-run evaluation.
-- The agentic cases test two general behaviors: explaining offsetting missing/duplicate records and
-  localizing a numeric discrepancy to the responsible category. No dataset name or expected answer
-  is hardcoded into the investigation logic.
-- Free-model availability and consistency can vary, so repeated agentic runs are still recommended
-  before making production reliability claims.
+
+## Evaluation in brief
+
+ReconAI was checked with automated tests and two public-data evaluation styles:
+
+- **51/51 automated tests** passed for the tools, workflow, evidence controls, and report output.
+- **2/2 TPC-H agentic cases** passed: one required explaining multiple offsetting data problems;
+  the other required finding which category contained a numeric discrepancy.
+- **1/1 Olist relationship case** passed: the system found a missing related record without
+  incorrectly treating valid one-to-many payment rows as duplicates.
+
+These evaluations check whether both agents run, whether the correct deterministic tools are used,
+and whether the final answer matches the evidence. Dataset names and expected answers are not
+hardcoded into the investigation logic. Results are encouraging for a portfolio MVP, but free-model
+availability and output consistency can vary between runs.
 
 See [evaluation details](evals/README.md) for benchmark setup and commands.
 
@@ -93,7 +120,7 @@ Set these values in `.env`:
 
 ```env
 OPENROUTER_API_KEY=your_openrouter_api_key_here
-OPENROUTER_MODEL=your_tool_capable_model
+OPENROUTER_MODEL=openrouter/free
 OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 ```
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
+from src.agents.tool_adapter import build_crewai_tools
+from src.models import InvestigationState
 from src.tools import (
     calculate_business_impact,
     compare_aggregates,
@@ -11,8 +13,19 @@ from src.tools import (
     find_duplicates,
     find_unmatched_records,
     profile_dataset,
+    reconcile_record_set_contributions,
     segment_analysis,
 )
+
+
+def test_investigator_receives_record_set_contribution_tool():
+    state = InvestigationState(
+        investigation_id="tool-list",
+        question="Explain the net difference.",
+        dataset_paths=["source.csv", "target.csv"],
+    )
+    names = {tool.name for tool in build_crewai_tools(state)}
+    assert "reconcile_record_set_contributions" in names
 
 
 def test_profile_dataset(datasets):
@@ -150,6 +163,76 @@ def test_repeated_relationship_keys_are_distinct_from_exact_duplicates(tmp_path)
     assert "not automatically" in repeated_keys["interpretation"]
     assert exact_rows["analysis_type"] == "exact_row"
     assert exact_rows["duplicate_row_count"] == 0
+
+
+def test_record_set_contributions_reconcile_generic_missing_and_extra_copies(
+    tmp_path,
+):
+    ledger = tmp_path / "ledger.csv"
+    archive = tmp_path / "archive.csv"
+    pd.DataFrame(
+        {
+            "invoice_id": ["A", "B", "C"],
+            "state": ["posted", "posted", "posted"],
+            "balance": [100.0, 200.0, 300.0],
+        }
+    ).to_csv(ledger, index=False)
+    pd.DataFrame(
+        {
+            "invoice_id": ["A", "B", "B"],
+            "state": ["posted", "posted", "posted"],
+            "balance": [100.0, 200.0, 200.0],
+        }
+    ).to_csv(archive, index=False)
+
+    result = reconcile_record_set_contributions(
+        ledger,
+        archive,
+        "invoice_id",
+        "invoice_id",
+        "balance",
+        "balance",
+    )
+
+    assert result["dataset_a_only_unique_key_count"] == 1
+    assert result["dataset_a_only_metric_sum"] == 300.0
+    assert result["dataset_b_extra_exact_copy_count"] == 1
+    assert result["dataset_b_extra_exact_copy_key_count"] == 1
+    assert result["dataset_b_extra_exact_copy_metric_sum"] == 200.0
+    assert result["shared_key_residual_metric_difference_a_minus_b"] == 0.0
+    assert result["net_difference_a_minus_b"] == 100.0
+    assert result["arithmetic_reconciles"] is True
+    assert result["fully_explained_by_key_gaps_and_exact_copies"] is True
+    assert result["sample_dataset_b_extra_exact_copies"] == [
+        {
+            "invoice_id": "B",
+            "extra_copy_count": 1,
+            "balance": 200.0,
+            "extra_metric_sum": 200.0,
+        }
+    ]
+
+
+def test_record_set_contributions_keeps_value_drift_in_shared_residual(tmp_path):
+    left = tmp_path / "left.csv"
+    right = tmp_path / "right.csv"
+    pd.DataFrame({"case_id": [1, 2], "value": [10.0, 20.0]}).to_csv(
+        left, index=False
+    )
+    pd.DataFrame({"case_id": [1, 2], "value": [10.0, 25.0]}).to_csv(
+        right, index=False
+    )
+
+    result = reconcile_record_set_contributions(
+        left, right, "case_id", "case_id", "value", "value"
+    )
+
+    assert result["dataset_a_extra_exact_copy_count"] == 0
+    assert result["dataset_b_extra_exact_copy_count"] == 0
+    assert result["shared_key_residual_metric_difference_a_minus_b"] == -5.0
+    assert result["net_difference_a_minus_b"] == -5.0
+    assert result["arithmetic_reconciles"] is True
+    assert result["fully_explained_by_key_gaps_and_exact_copies"] is False
 
 
 def test_segment_analysis_for_unmatched_rows(datasets):

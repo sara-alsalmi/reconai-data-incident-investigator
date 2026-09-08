@@ -73,10 +73,20 @@ def score_run(result: Any, expected: dict) -> dict:
     causal_safety_pass = not any(
         term.lower() in hypothesis for term in forbidden_terms
     )
+    report_text = result.report.lower()
+    required_report_terms = expected.get("required_report_terms", [])
+    forbidden_report_phrases = expected.get("forbidden_report_phrases", [])
+    report_content_pass = all(
+        term.lower() in report_text for term in required_report_terms
+    ) and not any(
+        phrase.lower() in report_text for phrase in forbidden_report_phrases
+    )
     evidence_pass = all(item["passed"] for item in checks)
     attempts = result.state.attempt_count
     agent_evidence = [item for item in result.state.evidence if item.attempt > 0]
-    min_attempts = int(expected.get("min_attempts", 0))
+    # Every ReconAI run is multi-agent. A case may require zero follow-up tool
+    # calls, but it must still include an Investigator attempt and a Verifier verdict.
+    min_attempts = int(expected.get("min_attempts", 1))
     min_agent_tool_calls = int(expected.get("min_agent_tool_calls", 0))
     required_agent_tools = expected.get("required_agent_tools", {})
     agent_tool_counts = {
@@ -86,7 +96,7 @@ def score_run(result: Any, expected: dict) -> dict:
     observed_verdict = (
         result.state.verification.verdict.value if result.state.verification else None
     )
-    required_verdict = expected.get("required_verdict")
+    required_verdict = expected.get("required_verdict", "ACCEPT")
     verdict_pass = required_verdict is None or observed_verdict == required_verdict
     agentic_pass = (
         attempts >= min_attempts
@@ -98,10 +108,15 @@ def score_run(result: Any, expected: dict) -> dict:
         and verdict_pass
     )
     return {
-        "passed": evidence_pass and semantic_pass and causal_safety_pass and agentic_pass,
+        "passed": evidence_pass
+        and semantic_pass
+        and causal_safety_pass
+        and report_content_pass
+        and agentic_pass,
         "evidence_checks_passed": evidence_pass,
         "semantic_check_passed": semantic_pass,
         "causal_safety_passed": causal_safety_pass,
+        "report_content_passed": report_content_pass,
         "agentic_requirements_passed": agentic_pass,
         "attempts_observed": attempts,
         "agent_tool_calls_observed": len(agent_evidence),
@@ -110,6 +125,14 @@ def score_run(result: Any, expected: dict) -> dict:
         "verdict_observed": observed_verdict,
         "forbidden_hypothesis_terms_found": [
             term for term in forbidden_terms if term.lower() in hypothesis
+        ],
+        "missing_required_report_terms": [
+            term for term in required_report_terms if term.lower() not in report_text
+        ],
+        "forbidden_report_phrases_found": [
+            phrase
+            for phrase in forbidden_report_phrases
+            if phrase.lower() in report_text
         ],
         "checks": checks,
     }

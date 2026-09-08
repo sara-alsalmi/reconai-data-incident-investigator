@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from src.agents.runtime import _render_report, evidence_quality_guide
+from src.agents.runtime import build_openrouter_llm, _render_report, evidence_quality_guide
+from src.config import Settings
 from src.models import (
     BusinessReportDraft,
     DatasetProfile,
@@ -10,6 +11,24 @@ from src.models import (
     VerificationResult,
 )
 from src.state import _console_safe, add_trace
+
+
+def test_openrouter_free_router_keeps_its_full_model_slug(monkeypatch):
+    captured = {}
+
+    class FakeLLM:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("crewai.LLM", FakeLLM)
+    build_openrouter_llm(
+        Settings(
+            openrouter_api_key="test-key",
+            openrouter_model="openrouter/free",
+            openrouter_base_url="https://openrouter.ai/api/v1",
+        )
+    )
+    assert captured["model"] == "openrouter/openrouter/free"
 
 
 def test_quality_guide_prefers_channel_and_flags_constant_status():
@@ -95,6 +114,10 @@ def test_report_renderer_is_consistent_and_readable():
         remaining_uncertainty=["The technical failure mechanism is unknown."],
     )
     report = _render_report(draft, state, conclusive=True)
+    assert (
+        "> **Status:** Finding confirmed from uploaded files<br>\n"
+        "> **Confidence in data finding:** High"
+    ) in report
     assert "## Answer" in report
     assert "## Root Cause Assessment" not in report
     assert "## Impact and scope" in report
@@ -127,7 +150,9 @@ def test_report_ignores_unfiltered_whole_dataset_impact():
         investigation_id="report-guard",
         question="Which priority contains the amount discrepancy?",
         dataset_paths=["source.csv", "warehouse.csv"],
-        hypothesis="45 amount mismatches are localized to 2-HIGH.",
+        hypothesis=(
+            "A surcharge was applied to 45 records in the warehouse."
+        ),
         verification=VerificationResult(
             verdict=Verdict.ACCEPT,
             confidence=0.95,
@@ -144,6 +169,8 @@ def test_report_ignores_unfiltered_whole_dataset_impact():
                 supporting_details={
                     "dataset_a": "source.csv",
                     "dataset_b": "warehouse.csv",
+                    "key_column_a": "order_id",
+                    "value_column_a": "total_amount",
                     "value_mismatch_count": 45,
                     "signed_difference_a_minus_b": -1057.5,
                 },
@@ -219,6 +246,7 @@ def test_report_ignores_unfiltered_whole_dataset_impact():
     assert "45 matched-key rows with value mismatches" in report
     assert "order_priority = 2-HIGH" in report
     assert "-1,057.50 signed difference" in report
+    assert "surcharge" not in report.lower()
     assert "| Affected records | 15000 records" not in report
     assert "Calculated impact for all 15000 rows" not in report
 
@@ -380,3 +408,86 @@ def test_report_never_labels_repeated_relationship_keys_as_exact_duplicates():
 
     assert "participating in repeated keys" not in report
     assert "7 exact duplicate rows" not in report
+
+
+def test_report_renders_a_complete_generic_offsetting_reconciliation():
+    state = InvestigationState(
+        investigation_id="offsetting-report",
+        question=(
+            "The row counts match but the balance totals differ. Identify the affected "
+            "records and explain the net difference."
+        ),
+        dataset_paths=["ledger.csv", "archive.csv"],
+        hypothesis="Missing ledger records and archive duplicates offset each other.",
+        verification=VerificationResult(
+            verdict=Verdict.ACCEPT,
+            confidence=0.95,
+            reason="The arithmetic bridge closes.",
+        ),
+        evidence=[
+            EvidenceItem(
+                evidence_id="E001",
+                attempt=1,
+                finding="Reconciled record-set contributions",
+                tool="reconcile_record_set_contributions",
+                datasets=["ledger.csv", "archive.csv"],
+                supporting_details={
+                    "dataset_a": "ledger.csv",
+                    "dataset_b": "archive.csv",
+                    "key_column_a": "invoice_id",
+                    "key_column_b": "invoice_id",
+                    "metric_column_a": "balance",
+                    "metric_column_b": "balance",
+                    "dataset_a_only_unique_key_count": 1,
+                    "dataset_a_only_row_count": 1,
+                    "dataset_a_only_metric_sum": 300.0,
+                    "dataset_b_only_unique_key_count": 0,
+                    "dataset_b_only_row_count": 0,
+                    "dataset_b_only_metric_sum": 0.0,
+                    "dataset_a_extra_exact_copy_count": 0,
+                    "dataset_a_extra_exact_copy_key_count": 0,
+                    "dataset_a_extra_exact_copy_metric_sum": 0.0,
+                    "dataset_b_extra_exact_copy_count": 1,
+                    "dataset_b_extra_exact_copy_key_count": 1,
+                    "dataset_b_extra_exact_copy_metric_sum": 200.0,
+                    "shared_key_residual_metric_difference_a_minus_b": 0.0,
+                    "net_difference_a_minus_b": 100.0,
+                    "arithmetic_reconciles": True,
+                    "sample_dataset_a_extra_exact_copies": [],
+                    "sample_dataset_b_extra_exact_copies": [
+                        {
+                            "invoice_id": "B",
+                            "extra_copy_count": 1,
+                            "balance": 200.0,
+                            "extra_metric_sum": 200.0,
+                        }
+                    ],
+                    "samples_are_complete": {
+                        "dataset_a_extra_exact_copies": True,
+                        "dataset_b_extra_exact_copies": True,
+                    },
+                },
+            )
+        ],
+    )
+    draft = BusinessReportDraft(
+        executive_summary="unused",
+        data_level_cause="unused",
+        underlying_technical_cause="unknown",
+        confidence="High",
+        main_discrepancy="unused",
+        affected_records="unused",
+        affected_segment="unused",
+        affected_period="unused",
+        measurable_impact="unused",
+    )
+
+    report = _render_report(draft, state, conclusive=True)
+
+    assert "**1** `invoice_id` value" in report
+    assert "`archive.csv` contains **1** extra exact copy" in report
+    assert "**+100.00**" in report
+    assert "| Keys only in `ledger.csv` | 1 | +300.00 |" in report
+    assert "| Extra exact copies in `archive.csv` | 1 | -200.00 |" in report
+    assert "| **Net difference** |  | **+100.00** |" in report
+    assert "### `archive.csv` extra exact copies · E001" in report

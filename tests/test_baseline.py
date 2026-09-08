@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from src.baseline import (
-    collect_baseline_evidence,
-    collect_question_required_evidence,
-)
+import pandas as pd
+import pytest
+
+from src.baseline import collect_baseline_evidence
 from src.flow import ReconAIInvestigationFlow
 
 
@@ -21,50 +21,49 @@ def test_baseline_collects_mandatory_reconciliation_evidence(datasets):
     assert tools.count("calculate_business_impact") == 2
 
 
-def test_controller_collects_explicitly_requested_sum_once(datasets):
-    orders, payments = datasets
-    flow = ReconAIInvestigationFlow(
+@pytest.mark.parametrize(
+    "question",
+    [
         "Calculate the net source-minus-target amount difference.",
-        [orders, payments],
-    )
-    flow._profile()
-    collect_baseline_evidence(flow.state)
-    flow.state.attempt_count = 1
-
-    assert collect_question_required_evidence(flow.state) == 1
-    evidence = flow.state.evidence[-1]
-    assert evidence.attempt == 1
-    assert evidence.tool == "compare_aggregates"
-    assert evidence.supporting_details["aggregation"] == "sum"
-    assert evidence.supporting_details["metric_column_a"] == "amount"
-    assert evidence.supporting_details["signed_difference_a_minus_b"] == -300.0
-    assert collect_question_required_evidence(flow.state) == 0
-
-
-def test_controller_collects_paired_named_segment_totals(datasets):
-    orders, payments = datasets
-    flow = ReconAIInvestigationFlow(
         "Which channel contains the amount difference?",
-        [orders, payments],
+        "Explain what is causing the amount difference and identify affected records.",
+    ],
+)
+def test_baseline_does_not_preempt_adaptive_agent_analysis(datasets, question):
+    orders, payments = datasets
+    flow = ReconAIInvestigationFlow(question, [orders, payments])
+    flow._profile()
+    collect_baseline_evidence(flow.state)
+    assert all(item.attempt == 0 for item in flow.state.evidence)
+    assert not any(
+        item.tool == "compare_aggregates"
+        and item.supporting_details.get("aggregation") == "sum"
+        for item in flow.state.evidence
+    )
+    assert not any(
+        item.tool in {"segment_analysis", "reconcile_record_set_contributions"}
+        for item in flow.state.evidence
+    )
+
+
+def test_offsetting_contribution_bridge_is_not_mandatory_baseline_evidence(tmp_path):
+    ledger = tmp_path / "ledger.csv"
+    archive = tmp_path / "archive.csv"
+    pd.DataFrame(
+        {"invoice_id": ["A", "B", "C"], "balance": [100.0, 200.0, 300.0]}
+    ).to_csv(ledger, index=False)
+    pd.DataFrame(
+        {"invoice_id": ["A", "B", "B"], "balance": [100.0, 200.0, 200.0]}
+    ).to_csv(archive, index=False)
+    flow = ReconAIInvestigationFlow(
+        "Explain what is causing the balance totals to differ, identify affected records, "
+        "and calculate the net difference.",
+        [str(ledger), str(archive)],
     )
     flow._profile()
     collect_baseline_evidence(flow.state)
-    flow.state.attempt_count = 1
-
-    assert collect_question_required_evidence(flow.state) == 3
-    segment_evidence = [
-        item
+    assert all(item.attempt == 0 for item in flow.state.evidence)
+    assert not any(
+        item.tool == "reconcile_record_set_contributions"
         for item in flow.state.evidence
-        if item.attempt == 1 and item.tool == "segment_analysis"
-    ]
-    assert len(segment_evidence) == 2
-    assert {item.supporting_details["dataset"] for item in segment_evidence} == {
-        "orders.csv",
-        "payments.csv",
-    }
-    assert all(
-        item.supporting_details["grouping"] == ["channel"]
-        and item.supporting_details["metric_column"] == "amount"
-        and item.supporting_details["aggregation"] == "sum"
-        for item in segment_evidence
     )
